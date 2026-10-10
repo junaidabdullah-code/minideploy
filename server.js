@@ -7,9 +7,7 @@ try {
   dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1']);
   dns.setDefaultResultOrder('ipv4first');
   console.log('[dns] using 8.8.8.8 / 1.1.1.1, ipv4first');
-} catch (e) {
-  console.warn('[dns] could not override servers:', e.message);
-}
+} catch (e) { console.warn('[dns] override failed:', e.message); }
 
 const fs = require('fs');
 const os = require('os');
@@ -27,12 +25,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const httpProxy = require('http-proxy');
 const mongoose = require('mongoose');
-const {
-  S3Client,
-  GetObjectCommand,
-  DeleteObjectCommand,
-  HeadObjectCommand,
-} = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 
 /* ============================================================
@@ -53,56 +46,56 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 const B2_REGION = process.env.B2_REGION || 'us-east-005';
 const B2_FOLDER = process.env.B2_FOLDER || 'bdeploy';
 
-// New production settings
-const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || '')
-  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const INVITE_ONLY = ALLOWED_EMAILS.length > 0;
 const MAX_PROJECTS_PER_USER = Number(process.env.MAX_PROJECTS_PER_USER || 5);
-const BUILD_TIMEOUT_MS = Number(process.env.BUILD_TIMEOUT_MS || 5 * 60 * 1000);
 
-// Validate required secrets at startup
+const GIT_TIMEOUT_MS = Number(process.env.GIT_TIMEOUT_MS || 2 * 60 * 1000);
+const INSTALL_IDLE_MS = Number(process.env.INSTALL_IDLE_MS || 90 * 1000);
+const INSTALL_MAX_MS = Number(process.env.INSTALL_MAX_MS || 6 * 60 * 1000);
+const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS || 45 * 1000);
+
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
-  console.error('FATAL: SESSION_SECRET must be set and at least 32 characters.');
+  console.error('FATAL: SESSION_SECRET must be ≥32 chars.');
   process.exit(1);
 }
-if (!MONGO_URI) {
-  console.error('FATAL: MONGO_URI is required.');
-  process.exit(1);
-}
+if (!MONGO_URI) { console.error('FATAL: MONGO_URI required.'); process.exit(1); }
 if (!B2_ENDPOINT || !B2_ACCESS_KEY_ID || !B2_SECRET_ACCESS_KEY || !B2_BUCKET_NAME) {
-  console.error('FATAL: B2_* environment variables are required.');
-  process.exit(1);
+  console.error('FATAL: B2_* env vars required.'); process.exit(1);
 }
 
 const TEMP_ROOT = path.join(os.tmpdir(), 'minideploy-work');
 fs.mkdirSync(TEMP_ROOT, { recursive: true });
+const NPM_CACHE_DIR = path.join(TEMP_ROOT, 'npm-cache');
+fs.mkdirSync(NPM_CACHE_DIR, { recursive: true });
 
+// Reserved names — cannot be used as project names.
+// Includes every dashboard route so path-based routing never collides.
 const RESERVED = new Set([
-  'www', 'api', 'admin', 'app', 'mail', 'ftp', 'cdn', 'static', 'assets',
-  'blog', 'docs', 'status', 'support', 'dashboard', 'test', 'dev', 'staging',
-  'root', 'localhost', 'ns', 'ns1', 'ns2', 'smtp', 'imap', 'pop', 'vpn', 'preview',
+  'www','api','admin','app','mail','ftp','cdn','static','assets','blog','docs',
+  'status','support','dashboard','test','dev','staging','root','localhost',
+  'ns','ns1','ns2','smtp','imap','pop','vpn','preview',
+  'health','favicon.ico','robots.txt','sitemap.xml','manifest.json',
+  'login','logout','signup','register','auth',
 ]);
 
 /* ============================================================
- * Child process env — strict whitelist
- *
- * Deployed apps MUST NOT see MONGO_URI, B2_*, SESSION_SECRET.
+ * Child env — whitelist
  * ============================================================ */
 
 const CHILD_ENV_SAFE_KEYS = [
-  'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'SHELL', 'TERM',
-  'TEMP', 'TMP', 'TMPDIR',
-  'USER', 'USERNAME', 'LOGNAME',
-  'SystemRoot', 'windir', 'PATHEXT', 'ComSpec', 'OS',
-  'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS',
-  'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMDATA',
-  'HOMEDRIVE', 'HOMEPATH',
+  'PATH','LANG','LC_ALL','LC_CTYPE','TZ','SHELL','TERM',
+  'TEMP','TMP','TMPDIR','USER','USERNAME','LOGNAME',
+  'SystemRoot','windir','PATHEXT','ComSpec','OS',
+  'PROCESSOR_ARCHITECTURE','NUMBER_OF_PROCESSORS',
+  'APPDATA','LOCALAPPDATA','PROGRAMFILES','PROGRAMFILES(X86)','PROGRAMDATA',
+  'HOMEDRIVE','HOMEPATH',
 ];
 
 const BLOCKED_USER_ENV = new Set([
-  'PATH', 'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
-  'NODE_OPTIONS', 'NODE_PATH', 'NODE_ENV', 'PORT', 'HOST',
-  'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+  'PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH',
+  'NODE_OPTIONS','NODE_PATH','NODE_ENV','PORT','HOST',
+  'LD_PRELOAD','LD_LIBRARY_PATH','DYLD_INSERT_LIBRARIES','DYLD_LIBRARY_PATH',
 ]);
 
 function sanitizeUserEnv(obj) {
@@ -121,37 +114,35 @@ function homeDirFor(projectId) {
   return dir;
 }
 
-function buildChildEnv(projectId, userEnv, port) {
+function buildChildEnv(projectId, userEnv, port, projectName) {
   const homeDir = homeDirFor(projectId);
   const env = {};
-
-  for (const k of CHILD_ENV_SAFE_KEYS) {
-    if (process.env[k] != null) env[k] = process.env[k];
-  }
-
-  // Override always
+  for (const k of CHILD_ENV_SAFE_KEYS) if (process.env[k] != null) env[k] = process.env[k];
   env.HOME = homeDir;
   env.USERPROFILE = homeDir;
   env.HOMEDRIVE = path.parse(homeDir).root;
   env.HOMEPATH = homeDir.slice(path.parse(homeDir).root.length);
   env.NODE_ENV = 'production';
-  if (port != null) {
-    env.PORT = String(port);
-    env.HOST = '0.0.0.0';
+  if (port != null) { env.PORT = String(port); env.HOST = '0.0.0.0'; }
+  if (projectName) {
+    // Pass the sub-path to the app so it can generate correct URLs
+    env.BASE_PATH = '/' + projectName;
+    env.PUBLIC_PATH = '/' + projectName;
+    env.PUBLIC_URL = '/' + projectName;
+    env.ASSET_PREFIX = '/' + projectName;
   }
-
-  // Quiet npm
   env.npm_config_update_notifier = 'false';
   env.npm_config_fund = 'false';
   env.npm_config_audit = 'false';
-  env.npm_config_cache = path.join(homeDir, '.npm');
-
+  env.npm_config_progress = 'false';
+  env.npm_config_loglevel = 'error';
+  env.npm_config_cache = NPM_CACHE_DIR;
   Object.assign(env, sanitizeUserEnv(userEnv));
   return env;
 }
 
 /* ============================================================
- * Backblaze B2 — streamed
+ * B2 — streamed I/O
  * ============================================================ */
 
 const s3 = new S3Client({
@@ -166,7 +157,7 @@ const b2Key = (projectId) => B2_FOLDER + '/' + projectId + '.tar.gz';
 async function uploadToB2(projectId, sourceDir) {
   const tarPath = path.join(TEMP_ROOT, projectId + '.tar.gz');
   try {
-    await tarPack({ gzip: true, file: tarPath, cwd: sourceDir }, ['.']);
+    await tarPack({ gzip: { level: 1 }, file: tarPath, cwd: sourceDir }, ['.']);
     const stat = fs.statSync(tarPath);
     const upload = new Upload({
       client: s3,
@@ -177,6 +168,8 @@ async function uploadToB2(projectId, sourceDir) {
         ContentType: 'application/gzip',
         ContentLength: stat.size,
       },
+      queueSize: 4,
+      partSize: 5 * 1024 * 1024,
     });
     await upload.done();
     console.log('[b2] uploaded', b2Key(projectId), '(' + (stat.size / 1024).toFixed(1) + ' KB)');
@@ -188,20 +181,14 @@ async function uploadToB2(projectId, sourceDir) {
 async function downloadFromB2(projectId, destDir) {
   const tarPath = path.join(TEMP_ROOT, projectId + '-dl.tar.gz');
   try {
-    const resp = await s3.send(new GetObjectCommand({
-      Bucket: B2_BUCKET_NAME,
-      Key: b2Key(projectId),
-    }));
+    const resp = await s3.send(new GetObjectCommand({ Bucket: B2_BUCKET_NAME, Key: b2Key(projectId) }));
     await pipeline(resp.Body, fs.createWriteStream(tarPath));
     fs.mkdirSync(destDir, { recursive: true });
     await tarExtract({ file: tarPath, cwd: destDir });
     console.log('[b2] downloaded', b2Key(projectId));
     return true;
   } catch (err) {
-    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
-      console.log('[b2] no archive for', projectId);
-      return false;
-    }
+    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) return false;
     throw err;
   } finally {
     try { fs.unlinkSync(tarPath); } catch (e) {}
@@ -210,14 +197,8 @@ async function downloadFromB2(projectId, destDir) {
 
 async function deleteFromB2(projectId) {
   try {
-    await s3.send(new DeleteObjectCommand({
-      Bucket: B2_BUCKET_NAME,
-      Key: b2Key(projectId),
-    }));
-    console.log('[b2] deleted', b2Key(projectId));
-  } catch (err) {
-    console.warn('[b2] delete failed:', err.message);
-  }
+    await s3.send(new DeleteObjectCommand({ Bucket: B2_BUCKET_NAME, Key: b2Key(projectId) }));
+  } catch (err) { console.warn('[b2] delete failed:', err.message); }
 }
 
 /* ============================================================
@@ -263,14 +244,16 @@ const safeJson = (val, fallback = {}) => {
 };
 
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
+const sourceDir = (projectId) => path.join(TEMP_ROOT, 'src-' + projectId);
+
+// In-memory cache of project names for fast path-routing
+const projectNames = new Set();
 
 function allocatePort() {
   const used = new Set([...running.values()].map((r) => r.port).filter(Boolean));
   for (let p = APP_PORT_START; p <= APP_PORT_END; p++) if (!used.has(p)) return p;
   throw new Error('No free app ports');
 }
-
-const sourceDir = (projectId) => path.join(TEMP_ROOT, 'src-' + projectId);
 
 function parseEnvText(text) {
   const out = {};
@@ -283,8 +266,7 @@ function parseEnvText(text) {
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let val = line.slice(eq + 1).trim();
-    if ((val.startsWith('"') && val.endsWith('"')) ||
-        (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
     out[key] = val;
   }
   return out;
@@ -304,35 +286,29 @@ function serializeProject(p) {
 }
 
 /* ============================================================
- * Rate limiter — in-memory, IP-based
+ * Rate limiter
  * ============================================================ */
 
 function createRateLimiter(opts) {
   const windowMs = opts.windowMs || 15 * 60 * 1000;
   const max = opts.max || 30;
   const buckets = new Map();
-
-  // Cleanup every minute
   setInterval(() => {
     const now = Date.now();
     for (const [k, arr] of buckets) {
       const fresh = arr.filter((t) => now - t < windowMs);
-      if (fresh.length) buckets.set(k, fresh);
-      else buckets.delete(k);
+      if (fresh.length) buckets.set(k, fresh); else buckets.delete(k);
     }
   }, 60_000).unref();
-
   return function (req, res, next) {
     const key = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
     const now = Date.now();
     const arr = (buckets.get(key) || []).filter((t) => now - t < windowMs);
-
     if (arr.length >= max) {
       const retryAfter = Math.ceil((windowMs - (now - arr[0])) / 1000);
       res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({ error: 'Too many requests. Try again in ' + retryAfter + 's.' });
+      return res.status(429).json({ error: 'Too many requests. Retry in ' + retryAfter + 's.' });
     }
-
     arr.push(now);
     buckets.set(key, arr);
     next();
@@ -354,19 +330,13 @@ function appendLog(projectId, chunk) {
   buf += chunk;
   if (buf.length > MAX_LOG_CHARS) buf = buf.slice(buf.length - MAX_LOG_CHARS);
   logBuffers.set(projectId, buf);
-
   const subs = logSubscribers.get(projectId);
   if (subs) for (const fn of subs) { try { fn(chunk); } catch (e) {} }
-
   if (!logSaveTimers.has(projectId)) {
     logSaveTimers.set(projectId, setTimeout(async () => {
       logSaveTimers.delete(projectId);
       try {
-        await LogEntry.findOneAndUpdate(
-          { project_id: projectId },
-          { content: logBuffers.get(projectId) || '' },
-          { upsert: true }
-        );
+        await LogEntry.findOneAndUpdate({ project_id: projectId }, { content: logBuffers.get(projectId) || '' }, { upsert: true });
       } catch (e) {}
     }, 2000));
   }
@@ -401,8 +371,7 @@ const running = new Map();
 function killTree(child) {
   if (!child || child.killed) return;
   if (process.platform === 'win32') {
-    try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); }
-    catch (e) {}
+    try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch (e) {}
   } else {
     try { process.kill(-child.pid, 'SIGTERM'); }
     catch (e) { try { child.kill('SIGTERM'); } catch (e2) {} }
@@ -412,32 +381,51 @@ function killTree(child) {
 function runCommand(command, cwd, projectId, opts) {
   opts = opts || {};
   const args = opts.args || [];
-  const timeoutMs = opts.timeoutMs || BUILD_TIMEOUT_MS;
+  const idleMs = opts.idleMs || 0;
+  const maxMs = opts.maxMs || 0;
 
   return new Promise((resolve, reject) => {
     const useShell = args.length === 0;
-    const env = buildChildEnv(projectId, {}, null);
+    const env = buildChildEnv(projectId, {}, null, null);
 
     const child = useShell
       ? spawn(command, { cwd, shell: true, env, detached: process.platform !== 'win32' })
       : spawn(command, args, { cwd, env, detached: process.platform !== 'win32' });
 
     let settled = false;
+    let idleTimer = null;
+    let maxTimer = null;
+
     const finish = (err) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (maxTimer) clearTimeout(maxTimer);
       if (err) reject(err); else resolve();
     };
 
-    const timer = setTimeout(() => {
-      appendLog(projectId, '\n[bdeploy] command timed out after ' + Math.round(timeoutMs / 1000) + 's — killing\n');
-      killTree(child);
-      finish(new Error('`' + command + '` timed out after ' + Math.round(timeoutMs / 1000) + 's'));
-    }, timeoutMs);
+    const resetIdle = () => {
+      if (!idleMs) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        appendLog(projectId, '\n[bdeploy] no output for ' + Math.round(idleMs / 1000) + 's — killing\n');
+        killTree(child);
+        finish(new Error('`' + command + '` idle for ' + Math.round(idleMs / 1000) + 's'));
+      }, idleMs);
+    };
 
-    child.stdout.on('data', (d) => appendLog(projectId, d.toString()));
-    child.stderr.on('data', (d) => appendLog(projectId, d.toString()));
+    if (maxMs) {
+      maxTimer = setTimeout(() => {
+        appendLog(projectId, '\n[bdeploy] exceeded ' + Math.round(maxMs / 1000) + 's — killing\n');
+        killTree(child);
+        finish(new Error('`' + command + '` exceeded ' + Math.round(maxMs / 1000) + 's'));
+      }, maxMs);
+    }
+
+    resetIdle();
+
+    child.stdout.on('data', (d) => { appendLog(projectId, d.toString()); resetIdle(); });
+    child.stderr.on('data', (d) => { appendLog(projectId, d.toString()); resetIdle(); });
     child.on('error', (err) => finish(new Error('spawn ' + command + ': ' + err.message)));
     child.on('close', (code) => {
       if (code === 0) return finish();
@@ -446,8 +434,31 @@ function runCommand(command, cwd, projectId, opts) {
   });
 }
 
+function buildFastInstall(userCommand, srcDir) {
+  const trimmed = String(userCommand || '').trim();
+  if (!trimmed || !/^npm\s+(install|i|ci)\b/.test(trimmed)) return trimmed || null;
+
+  const pkgPath = path.join(srcDir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return null;
+
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const deps = Object.keys(pkg.dependencies || {}).length;
+    const devDeps = Object.keys(pkg.devDependencies || {}).length;
+    if (deps === 0 && devDeps === 0) return null;
+  } catch (e) {}
+
+  const hasLockfile = fs.existsSync(path.join(srcDir, 'package-lock.json'));
+  const base = hasLockfile ? 'npm ci' : 'npm install';
+  const flags = [
+    '--omit=dev', '--no-audit', '--no-fund', '--no-progress',
+    '--prefer-offline', '--loglevel=error', '--cache ' + NPM_CACHE_DIR,
+  ].join(' ');
+  return base + ' ' + flags;
+}
+
 function waitForPort(port, timeoutMs) {
-  timeoutMs = timeoutMs || 25000;
+  timeoutMs = timeoutMs || STARTUP_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const tick = () => {
@@ -456,7 +467,7 @@ function waitForPort(port, timeoutMs) {
       sock.once('error', () => {
         sock.destroy();
         if (Date.now() - start > timeoutMs) return reject(new Error('timeout port ' + port));
-        setTimeout(tick, 300);
+        setTimeout(tick, 150);
       });
     };
     tick();
@@ -465,72 +476,78 @@ function waitForPort(port, timeoutMs) {
 
 function writePlaceholderApp(dir, name) {
   const indexJs =
-    "const http = require('http');\n" +
-    "const PORT = process.env.PORT || 3000;\n" +
-    "const NAME = " + JSON.stringify(name) + ";\n" +
-    "http.createServer(function (req, res) {\n" +
-    "  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });\n" +
-    "  res.end('<!doctype html><meta charset=\"utf-8\"><title>' + NAME + '</title>'\n" +
-    "    + '<body style=\"font-family:system-ui;background:#09090b;color:#e4e4e7;padding:60px;text-align:center;\">'\n" +
-    "    + '<h1 style=\"color:#fafafa;font-size:36px;\">' + NAME + '</h1>'\n" +
-    "    + '<p style=\"color:#a1a1aa;\">Your app is live. Deploy your own code by adding a Git repo URL.</p>');\n" +
-    "}).listen(PORT, function () { console.log('listening on port ' + PORT); });\n";
-  const pkg = JSON.stringify({
-    name, version: '1.0.0', private: true,
-    scripts: { start: 'node index.js' },
-  }, null, 2);
+    "const http=require('http');\n" +
+    "const PORT=process.env.PORT||3000;\n" +
+    "const NAME=" + JSON.stringify(name) + ";\n" +
+    "const BASE=process.env.BASE_PATH||'';\n" +
+    "http.createServer((req,res)=>{\n" +
+    "  if(req.url==='/login'){\n" +
+    "    res.writeHead(200,{'Content-Type':'text/html;charset=utf-8'});\n" +
+    "    return res.end('<!doctype html><meta charset=\"utf-8\"><title>Login</title>'\n" +
+    "      +'<body style=\"font-family:system-ui;background:#09090b;color:#e4e4e7;padding:60px;text-align:center;\">'\n" +
+    "      +'<h1 style=\"color:#fafafa;\">Login page</h1>'\n" +
+    "      +'<p style=\"color:#a1a1aa;\">This route works at <code>'+BASE+'/login</code>.</p>'\n" +
+    "      +'<p><a href=\"./\" style=\"color:#60a5fa;\">Back home</a></p>');\n" +
+    "  }\n" +
+    "  res.writeHead(200,{'Content-Type':'text/html;charset=utf-8'});\n" +
+    "  res.end('<!doctype html><meta charset=\"utf-8\"><title>'+NAME+'</title>'\n" +
+    "    +'<body style=\"font-family:system-ui;background:#09090b;color:#e4e4e7;padding:60px;text-align:center;\">'\n" +
+    "    +'<h1 style=\"color:#fafafa;font-size:36px;\">'+NAME+'</h1>'\n" +
+    "    +'<p style=\"color:#a1a1aa;\">Your app is live. BASE_PATH='+BASE+'</p>'\n" +
+    "    +'<p><a href=\"./login\" style=\"color:#60a5fa;\">Go to /login</a></p>');\n" +
+    "}).listen(PORT,()=>console.log('listening on port',PORT,'base',BASE));\n";
+  const pkg = JSON.stringify({ name, version: '1.0.0', private: true, scripts: { start: 'node index.js' } }, null, 2);
   fs.writeFileSync(path.join(dir, 'index.js'), indexJs, 'utf8');
   fs.writeFileSync(path.join(dir, 'package.json'), pkg, 'utf8');
 }
 
+/* ============================================================
+ * Start project
+ * ============================================================ */
+
 async function startProject(projectId) {
   stopProject(projectId, { silent: true });
-
   const project = await Project.findById(projectId);
   if (!project) return;
   const src = sourceDir(projectId);
 
   if (!fs.existsSync(path.join(src, 'package.json'))) {
-    appendLog(projectId, '[bdeploy] source not on disk, downloading from B2...\n');
+    appendLog(projectId, '[bdeploy] restoring source from B2...\n');
     const ok = await downloadFromB2(projectId, src);
     if (!ok) {
-      appendLog(projectId, '[bdeploy] no B2 archive found — triggering full deploy\n');
+      appendLog(projectId, '[bdeploy] no B2 archive — running full deploy\n');
       await deployProject(projectId);
       return;
     }
     if (project.install_command && project.install_command.trim()) {
-      appendLog(projectId, '$ ' + project.install_command + '\n');
-      try {
-        await runCommand(project.install_command, src, projectId);
-      } catch (err) {
-        appendLog(projectId, '[bdeploy] install failed: ' + err.message + '\n');
+      const fastInstall = buildFastInstall(project.install_command, src);
+      if (fastInstall) {
+        appendLog(projectId, '$ ' + fastInstall + '\n');
+        try {
+          await runCommand(fastInstall, src, projectId, { idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS });
+        } catch (err) {
+          appendLog(projectId, '[bdeploy] install warning: ' + err.message + '\n');
+        }
       }
     }
   }
 
   const port = allocatePort();
-  appendLog(projectId, '\n[bdeploy] starting "' + project.name + '" on port ' + port + '\n');
+  appendLog(projectId, '\n[bdeploy] starting on port ' + port + ' (base path: /' + project.name + '/)\n');
 
-  const childEnv = buildChildEnv(projectId, safeJson(project.env_vars), port);
-
+  const childEnv = buildChildEnv(projectId, safeJson(project.env_vars), port, project.name);
   const child = spawn(project.start_command, {
-    cwd: src,
-    shell: true,
-    detached: process.platform !== 'win32',
-    env: childEnv,
+    cwd: src, shell: true, detached: process.platform !== 'win32', env: childEnv,
   });
-
   running.set(projectId, { child, port });
 
   child.stdout.on('data', (d) => appendLog(projectId, d.toString()));
   child.stderr.on('data', (d) => appendLog(projectId, d.toString()));
-
   child.on('error', async (err) => {
     appendLog(projectId, '\n[bdeploy] start failed: ' + err.message + '\n');
     await Project.findByIdAndUpdate(projectId, { status: 'failed', pid: null });
     running.delete(projectId);
   });
-
   child.on('close', async (code) => {
     appendLog(projectId, '\n[bdeploy] process exited (' + code + ')\n');
     running.delete(projectId);
@@ -543,12 +560,12 @@ async function startProject(projectId) {
   await Project.findByIdAndUpdate(projectId, { status: 'starting', port, pid: child.pid });
 
   const suffix = PORT === 80 ? '' : ':' + PORT;
-  waitForPort(port, 25000).then(async () => {
+  waitForPort(port, STARTUP_TIMEOUT_MS).then(async () => {
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
-    appendLog(projectId, '[bdeploy] live → http://' + project.name + '.' + BASE_DOMAIN + suffix + '\n');
-    appendLog(projectId, '[bdeploy] preview → http://' + BASE_DOMAIN + suffix + '/preview/' + project.name + '/\n');
+    appendLog(projectId, '\n[bdeploy] ✓ live at http://' + BASE_DOMAIN + suffix + '/' + project.name + '/\n');
+    appendLog(projectId, '[bdeploy] ✓ app routes work: /' + project.name + '/login, /' + project.name + '/api/...\n');
   }).catch(async () => {
-    appendLog(projectId, '[bdeploy] warning: port ' + port + ' not ready within 25s\n');
+    appendLog(projectId, '[bdeploy] warning: port ' + port + ' not ready within ' + Math.round(STARTUP_TIMEOUT_MS / 1000) + 's\n');
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
   });
 }
@@ -563,63 +580,97 @@ function stopProject(projectId, opts) {
   }
 }
 
+/* ============================================================
+ * Deploy pipeline — FAST
+ * ============================================================ */
+
 async function deployProject(projectId) {
   const project = await Project.findById(projectId);
   if (!project) return;
 
   await Project.findByIdAndUpdate(projectId, { status: 'building' });
   logBuffers.set(projectId, '');
-  appendLog(projectId, '[bdeploy] deploy started ' + new Date().toISOString() + '\n');
+  appendLog(projectId, '[bdeploy] ⚡ fast deploy started ' + new Date().toISOString() + '\n');
 
   const src = sourceDir(projectId);
+  const t0 = Date.now();
 
   try {
     if (project.repo_url) {
       if (!/^https?:\/\/|^git@/i.test(project.repo_url)) {
-        throw new Error('Invalid repository URL — must start with http(s):// or git@');
+        throw new Error('Invalid repo URL — must start with http(s):// or git@');
       }
 
       const hasGit = fs.existsSync(path.join(src, '.git'));
       if (hasGit) {
-        appendLog(projectId, '$ git fetch --all && git reset --hard HEAD\n');
-        await runCommand('git', src, projectId, { args: ['fetch', '--all'] });
-        await runCommand('git', src, projectId, { args: ['reset', '--hard', 'HEAD'] });
-        await runCommand('git', src, projectId, { args: ['pull', '--force'] });
+        appendLog(projectId, '[bdeploy] step 1/2 — pulling latest\n');
+        appendLog(projectId, '$ git fetch --depth 1 --no-tags origin\n');
+        await runCommand('git', src, projectId, {
+          args: ['fetch', '--depth', '1', '--no-tags', 'origin'],
+          maxMs: GIT_TIMEOUT_MS,
+        });
+        appendLog(projectId, '$ git reset --hard FETCH_HEAD\n');
+        await runCommand('git', src, projectId, {
+          args: ['reset', '--hard', 'FETCH_HEAD'],
+          maxMs: GIT_TIMEOUT_MS,
+        });
       } else {
         fs.rmSync(src, { recursive: true, force: true });
-        appendLog(projectId, '$ git clone --depth 1 ' + project.repo_url + '\n');
+        appendLog(projectId, '[bdeploy] step 1/2 — cloning (shallow)\n');
+        appendLog(projectId, '$ git clone --depth 1 --single-branch --no-tags\n');
         await runCommand('git', TEMP_ROOT, projectId, {
-          args: ['clone', '--depth', '1', project.repo_url, src],
+          args: ['clone', '--depth', '1', '--single-branch', '--no-tags', project.repo_url, src],
+          maxMs: GIT_TIMEOUT_MS,
         });
       }
     } else {
       fs.mkdirSync(src, { recursive: true });
       if (!fs.existsSync(path.join(src, 'package.json'))) {
-        appendLog(projectId, '[bdeploy] no repo URL → placeholder app\n');
+        appendLog(projectId, '[bdeploy] step 1/2 — writing placeholder app\n');
         writePlaceholderApp(src, project.name);
       }
     }
 
-    if (project.install_command && project.install_command.trim()) {
-      appendLog(projectId, '$ ' + project.install_command + '\n');
-      await runCommand(project.install_command, src, projectId);
+    const fastInstall = buildFastInstall(project.install_command, src);
+    if (fastInstall) {
+      appendLog(projectId, '[bdeploy] step 2/2 — installing dependencies\n');
+      appendLog(projectId, '$ ' + fastInstall + '\n');
+      await runCommand(fastInstall, src, projectId, {
+        idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS,
+      });
+    } else {
+      appendLog(projectId, '[bdeploy] step 2/2 — no dependencies to install\n');
     }
 
-    appendLog(projectId, '[bdeploy] archiving to B2...\n');
-    try {
-      await uploadToB2(projectId, src);
-      await Project.findByIdAndUpdate(projectId, { has_b2_archive: true, last_deploy: new Date() });
-      appendLog(projectId, '[bdeploy] archived to B2 ✓\n');
-    } catch (err) {
-      appendLog(projectId, '[bdeploy] B2 upload warning: ' + err.message + '\n');
-    }
+    const installMs = Date.now() - t0;
+    appendLog(projectId, '[bdeploy] install finished in ' + (installMs / 1000).toFixed(1) + 's — starting app\n');
 
     await startProject(projectId);
+
+    archiveToB2Background(projectId, src).catch((err) => {
+      console.error('[bg-archive]', projectId, err.message);
+    });
+
   } catch (err) {
-    appendLog(projectId, '\n[bdeploy] DEPLOY FAILED: ' + err.message + '\n');
+    appendLog(projectId, '\n[bdeploy] ✗ DEPLOY FAILED: ' + err.message + '\n');
     await Project.findByIdAndUpdate(projectId, { status: 'failed' });
   }
 }
+
+async function archiveToB2Background(projectId, src) {
+  try {
+    appendLog(projectId, '\n[bdeploy] 📦 archiving to B2 (background)\n');
+    await uploadToB2(projectId, src);
+    await Project.findByIdAndUpdate(projectId, { has_b2_archive: true, last_deploy: new Date() });
+    appendLog(projectId, '[bdeploy] ✓ archived to B2\n');
+  } catch (err) {
+    appendLog(projectId, '[bdeploy] ⚠ B2 upload failed: ' + err.message + '\n');
+  }
+}
+
+/* ============================================================
+ * Autostart
+ * ============================================================ */
 
 async function autoStartProjects() {
   try {
@@ -627,17 +678,12 @@ async function autoStartProjects() {
       status: { $in: ['running', 'starting', 'stopped', 'building'] },
       $or: [{ has_b2_archive: true }, { repo_url: { $ne: null } }],
     }).limit(50);
-
     if (!all.length) { console.log('[boot] no projects to auto-start'); return; }
     console.log('[boot] auto-starting ' + all.length + ' project(s)...');
-
     for (const p of all) {
       const pid = String(p._id);
       await loadLogs(pid);
-      setTimeout(() => {
-        startProject(pid).catch((err) =>
-          console.error('[boot] start', p.name, err.message));
-      }, 800);
+      setTimeout(() => startProject(pid).catch((err) => console.error('[boot] start', p.name, err.message)), 800);
     }
   } catch (err) {
     console.error('[boot] autostart failed:', err.message);
@@ -652,17 +698,13 @@ const signToken = (userId) => jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn:
 
 function setAuthCookie(res, userId) {
   res.cookie('token', signToken(userId), {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: IS_PROD,
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    path: '/',
+    httpOnly: true, sameSite: 'lax', secure: IS_PROD,
+    maxAge: 7 * 24 * 60 * 60 * 1000, path: '/',
   });
 }
 
 function currentUser(req) {
-  const token = (req.cookies && req.cookies.token) ||
-    (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const token = (req.cookies && req.cookies.token) || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!token) return null;
   try { return { id: jwt.verify(token, JWT_SECRET).sub }; }
   catch (e) { return null; }
@@ -683,24 +725,19 @@ async function requireAuth(req, res, next) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1); // Render sits in front of us
+app.set('trust proxy', 1);
 
-// Security headers
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-  if (IS_PROD) {
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  }
+  if (IS_PROD) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
-
-/* ---------- Rate limiters ---------- */
 
 const authLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const signupLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 });
@@ -709,13 +746,13 @@ const createProjectLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 
 /* ---------- Health ---------- */
 
 app.get('/health', (req, res) => {
-  const mongoOk = mongoose.connection.readyState === 1;
   res.status(200).json({
     ok: true,
-    mongo: mongoOk ? 'connected' : 'disconnected',
+    mongo: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
     uptime: Math.floor(process.uptime()),
     running: running.size,
-    version: '1.0.0',
+    projects: projectNames.size,
+    version: '1.2.0',
   });
 });
 
@@ -725,52 +762,30 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
     const email = String((req.body && req.body.email) || '').trim().toLowerCase();
     const password = String((req.body && req.body.password) || '');
-
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
-      return res.status(400).json({ error: 'Invalid email' });
-    if (password.length < 8)
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    if (password.length > 200)
-      return res.status(400).json({ error: 'Password too long' });
-
-    if (INVITE_ONLY && !ALLOWED_EMAILS.includes(email)) {
-      return res.status(403).json({ error: 'This email is not on the invite list' });
-    }
-
-    if (await User.findOne({ email }))
-      return res.status(409).json({ error: 'Email already registered' });
-
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be ≥8 characters' });
+    if (password.length > 200) return res.status(400).json({ error: 'Password too long' });
+    if (INVITE_ONLY && !ALLOWED_EMAILS.includes(email)) return res.status(403).json({ error: 'Not on the invite list' });
+    if (await User.findOne({ email })) return res.status(409).json({ error: 'Email already registered' });
     const password_hash = await bcrypt.hash(password, 12);
     const user = await User.create({ email, password_hash });
     setAuthCookie(res, String(user._id));
     res.status(201).json({ user: { id: String(user._id), email } });
-  } catch (err) {
-    console.error('[signup]', err);
-    res.status(500).json({ error: 'Signup failed' });
-  }
+  } catch (err) { console.error('[signup]', err); res.status(500).json({ error: 'Signup failed' }); }
 });
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const email = String((req.body && req.body.email) || '').trim().toLowerCase();
     const password = String((req.body && req.body.password) || '');
-
     const user = await User.findOne({ email });
-    if (!user || !(await bcrypt.compare(password, user.password_hash)))
-      return res.status(401).json({ error: 'Invalid credentials' });
-
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid credentials' });
     setAuthCookie(res, String(user._id));
     res.json({ user: { id: String(user._id), email: user.email } });
-  } catch (err) {
-    console.error('[login]', err);
-    res.status(500).json({ error: 'Login failed' });
-  }
+  } catch (err) { console.error('[login]', err); res.status(500).json({ error: 'Login failed' }); }
 });
 
-app.post('/api/auth/logout', (req, res) => {
-  res.clearCookie('token', { path: '/' });
-  res.json({ ok: true });
-});
+app.post('/api/auth/logout', (req, res) => { res.clearCookie('token', { path: '/' }); res.json({ ok: true }); });
 
 app.get('/api/auth/me', async (req, res) => {
   const cu = currentUser(req);
@@ -780,7 +795,7 @@ app.get('/api/auth/me', async (req, res) => {
   res.json({ user: { id: String(user._id), email: user.email } });
 });
 
-/* ---------- Projects ---------- */
+/* ---------- Projects API ---------- */
 
 app.get('/api/projects', requireAuth, async (req, res) => {
   const list = await Project.find({ user_id: req.user.id }).sort({ createdAt: -1 }).lean();
@@ -799,40 +814,29 @@ app.post('/api/projects', requireAuth, createProjectLimiter, async (req, res) =>
     const repoUrl = String(body.repoUrl || '').trim() || null;
     const installCommand = String(body.installCommand != null ? body.installCommand : 'npm install').trim();
     const startCommand = String(body.startCommand != null ? body.startCommand : 'npm start').trim();
-    const envObj = typeof body.env === 'string'
-      ? parseEnvText(body.env)
+    const envObj = typeof body.env === 'string' ? parseEnvText(body.env)
       : (body.env && typeof body.env === 'object' && !Array.isArray(body.env) ? body.env : {});
 
-    if (!NAME_RE.test(name))
-      return res.status(400).json({ error: 'Name: 1-32 chars, lowercase, alphanumeric + dash' });
-    if (RESERVED.has(name))
-      return res.status(400).json({ error: '"' + name + '" is reserved' });
-    if (await Project.findOne({ name }))
-      return res.status(409).json({ error: '"' + name + '" is taken' });
-    if (!startCommand)
-      return res.status(400).json({ error: 'Start command required' });
-    if (installCommand.length > 500 || startCommand.length > 500)
-      return res.status(400).json({ error: 'Commands too long (max 500 chars)' });
+    if (!NAME_RE.test(name)) return res.status(400).json({ error: 'Name: 1-32 chars, lowercase, alphanumeric + dash' });
+    if (RESERVED.has(name)) return res.status(400).json({ error: '"' + name + '" is reserved' });
+    if (await Project.findOne({ name })) return res.status(409).json({ error: '"' + name + '" is taken' });
+    if (!startCommand) return res.status(400).json({ error: 'Start command required' });
+    if (installCommand.length > 500 || startCommand.length > 500) return res.status(400).json({ error: 'Commands too long' });
 
     const count = await Project.countDocuments({ user_id: req.user.id });
-    if (count >= MAX_PROJECTS_PER_USER)
-      return res.status(403).json({ error: 'Project limit reached (' + MAX_PROJECTS_PER_USER + ')' });
+    if (count >= MAX_PROJECTS_PER_USER) return res.status(403).json({ error: 'Project limit reached (' + MAX_PROJECTS_PER_USER + ')' });
 
     const project = await Project.create({
       user_id: req.user.id, name, repo_url: repoUrl,
       install_command: installCommand, start_command: startCommand,
       env_vars: JSON.stringify(envObj), status: 'created',
     });
-
     const pid = String(project._id);
+    projectNames.add(name);                     // cache for path routing
     fs.mkdirSync(sourceDir(pid), { recursive: true });
-
     res.status(201).json({ project: serializeProject(project) });
     deployProject(pid).catch((err) => console.error('[deploy]', err));
-  } catch (err) {
-    console.error('[create-project]', err);
-    res.status(500).json({ error: 'Failed to create project' });
-  }
+  } catch (err) { console.error('[create-project]', err); res.status(500).json({ error: 'Failed to create project' }); }
 });
 
 async function ownProject(req, res) {
@@ -874,13 +878,11 @@ app.get('/api/projects/:id/logs/stream', requireAuth, async (req, res) => {
   const p = await ownProject(req, res); if (!p) return;
   const pid = String(p._id);
   if (!logBuffers.has(pid)) await loadLogs(pid);
-
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   if (res.flushHeaders) res.flushHeaders();
-
   const send = (obj) => { try { res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch (e) {} };
   send({ reset: true, chunk: readLogs(pid) });
   const unsub = subscribeLogs(pid, (chunk) => send({ chunk }));
@@ -905,6 +907,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
   const p = await ownProject(req, res); if (!p) return;
   const pid = String(p._id);
   stopProject(pid);
+  projectNames.delete(p.name);                // remove from cache
   try { fs.rmSync(sourceDir(pid), { recursive: true, force: true }); } catch (e) {}
   await Project.findByIdAndDelete(p._id);
   await LogEntry.deleteOne({ project_id: pid });
@@ -917,7 +920,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 /* ============================================================
- * DASHBOARD — premium zinc UI (unchanged)
+ * Dashboard HTML — premium zinc UI
  * ============================================================ */
 
 const DASHBOARD_HTML = String.raw`<!doctype html>
@@ -932,16 +935,16 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{
-  --z50:#fafafa;  --z100:#f4f4f5; --z200:#e4e4e7; --z300:#d4d4d8;
-  --z400:#a1a1aa; --z500:#71717a; --z600:#52525b; --z700:#3f3f46;
-  --z800:#27272a; --z900:#18181b; --z950:#09090b;
-  --bg:#0a0a0c; --surface:#111114; --raised:#17171b; --overlay:#1c1c21;
-  --bd:rgba(255,255,255,.055); --bd-soft:rgba(255,255,255,.035); --bd-strong:rgba(255,255,255,.09);
-  --tx:#fafafa; --tx-soft:#d4d4d8; --tx-mut:#8a8a93; --tx-dim:#5c5c66;
-  --ok:#10b981; --ok-bg:rgba(16,185,129,.10); --ok-bd:rgba(16,185,129,.22);
-  --wn:#f59e0b; --wn-bg:rgba(245,158,11,.10); --wn-bd:rgba(245,158,11,.22);
-  --er:#ef4444; --er-bg:rgba(239,68,68,.10); --er-bd:rgba(239,68,68,.22);
-  --in:#3b82f6; --in-bg:rgba(59,130,246,.10); --in-bd:rgba(59,130,246,.22);
+  --z50:#fafafa;--z100:#f4f4f5;--z200:#e4e4e7;--z300:#d4d4d8;
+  --z400:#a1a1aa;--z500:#71717a;--z600:#52525b;--z700:#3f3f46;
+  --z800:#27272a;--z900:#18181b;--z950:#09090b;
+  --bg:#0a0a0c;--surface:#111114;--raised:#17171b;--overlay:#1c1c21;
+  --bd:rgba(255,255,255,.055);--bd-soft:rgba(255,255,255,.035);--bd-strong:rgba(255,255,255,.09);
+  --tx:#fafafa;--tx-soft:#d4d4d8;--tx-mut:#8a8a93;--tx-dim:#5c5c66;
+  --ok:#10b981;--ok-bg:rgba(16,185,129,.10);--ok-bd:rgba(16,185,129,.22);
+  --wn:#f59e0b;--wn-bg:rgba(245,158,11,.10);--wn-bd:rgba(245,158,11,.22);
+  --er:#ef4444;--er-bg:rgba(239,68,68,.10);--er-bd:rgba(239,68,68,.22);
+  --in:#3b82f6;--in-bg:rgba(59,130,246,.10);--in-bd:rgba(59,130,246,.22);
   --display:'Manrope','Inter',system-ui,sans-serif;
   --body:'Inter',system-ui,sans-serif;
   --mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
@@ -951,7 +954,7 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
   --sh-xl:0 24px 48px -12px rgba(0,0,0,.7),0 8px 16px -8px rgba(0,0,0,.5);
   --sh-2xl:0 48px 96px -24px rgba(0,0,0,.85);
   --sh-inset:inset 0 1px 0 rgba(255,255,255,.04);
-  --r:10px; --r-sm:7px; --r-lg:14px;
+  --r:10px;--r-sm:7px;--r-lg:14px;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{background:var(--bg);color:var(--tx-soft);font-family:var(--body);
@@ -1118,6 +1121,8 @@ main{padding:52px 0 120px;}
 .url i{font-size:9.5px;color:var(--tx-dim);flex-shrink:0;width:12px;text-align:center;}
 .url a{color:var(--tx-mut);}
 .url a:hover{color:var(--tx);}
+.url .tag{font-family:var(--body);font-size:9px;font-weight:700;letter-spacing:.1em;
+  padding:1px 5px;border:1px solid var(--bd-strong);color:var(--tx-dim);margin-left:auto;flex-shrink:0;}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:100px;
   font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
   border:1px solid;white-space:nowrap;flex-shrink:0;font-family:var(--body);}
@@ -1229,21 +1234,12 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 </style>
 </head>
 <body>
-
 <header class="topbar hidden" id="topbar">
   <div class="topbar-in">
-    <div class="logo">
-      <span class="logo-mark"><i class="fa-solid fa-rocket"></i></span>
-      <span>MiniDeploy</span>
-    </div>
+    <div class="logo"><span class="logo-mark"><i class="fa-solid fa-rocket"></i></span><span>MiniDeploy</span></div>
     <div class="topbar-right">
-      <div class="user-chip">
-        <div class="avatar" id="userAv">U</div>
-        <span id="userEmail">user@example.com</span>
-      </div>
-      <button class="btn btn-ghost sm" id="logoutBtn" type="button">
-        <i class="fa-solid fa-arrow-right-from-bracket"></i>Log out
-      </button>
+      <div class="user-chip"><div class="avatar" id="userAv">U</div><span id="userEmail">user@example.com</span></div>
+      <button class="btn btn-ghost sm" id="logoutBtn" type="button"><i class="fa-solid fa-arrow-right-from-bracket"></i>Log out</button>
     </div>
   </div>
 </header>
@@ -1252,10 +1248,7 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   <div class="auth-shell">
     <div class="auth-brand">
       <div class="auth-brand-icon"><i class="fa-solid fa-rocket"></i></div>
-      <div class="auth-brand-text">
-        <h1>MiniDeploy</h1>
-        <p>Ship Node.js apps to their own subdomain</p>
-      </div>
+      <div class="auth-brand-text"><h1>MiniDeploy</h1><p>Ship Node.js apps to their own path</p></div>
     </div>
     <div class="auth-card">
       <div class="auth-tabs">
@@ -1263,14 +1256,10 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
         <button id="tabSignup" type="button">Sign up</button>
       </div>
       <form id="authForm" class="auth-form">
-        <div class="field">
-          <label for="email"><i class="fa-solid fa-envelope"></i>Email address</label>
-          <input id="email" class="input" type="email" autocomplete="email" required placeholder="you@example.com">
-        </div>
-        <div class="field">
-          <label for="password"><i class="fa-solid fa-lock"></i>Password</label>
-          <input id="password" class="input" type="password" autocomplete="current-password" required placeholder="At least 8 characters" minlength="8">
-        </div>
+        <div class="field"><label for="email"><i class="fa-solid fa-envelope"></i>Email address</label>
+          <input id="email" class="input" type="email" autocomplete="email" required placeholder="you@example.com"></div>
+        <div class="field"><label for="password"><i class="fa-solid fa-lock"></i>Password</label>
+          <input id="password" class="input" type="password" autocomplete="current-password" required placeholder="At least 8 characters" minlength="8"></div>
         <button type="submit" id="authSubmit" class="btn btn-primary block" style="margin-top:22px;">
           <i class="fa-solid fa-arrow-right-to-bracket"></i><span id="authSubmitText">Log in</span>
         </button>
@@ -1282,13 +1271,8 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 
 <main class="container hidden" id="dashView">
   <div class="page-head">
-    <div>
-      <h1 class="page-title">Projects</h1>
-      <p class="page-sub">Deploy, manage, and monitor your applications.</p>
-    </div>
-    <button id="newProjectBtn" class="btn btn-primary" type="button">
-      <i class="fa-solid fa-plus"></i>New project
-    </button>
+    <div><h1 class="page-title">Projects</h1><p class="page-sub">Deploy, manage, and monitor your applications.</p></div>
+    <button id="newProjectBtn" class="btn btn-primary" type="button"><i class="fa-solid fa-plus"></i>New project</button>
   </div>
   <div class="stats" id="statsRow"></div>
   <div id="projects"></div>
@@ -1297,44 +1281,31 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 <dialog id="newDialog">
   <div class="dlg-head">
     <div class="dlg-icon"><i class="fa-solid fa-cube"></i></div>
-    <div>
-      <div class="dlg-title">New project</div>
-      <div class="dlg-sub">Preview at <code id="newHint">/preview/myapp/</code></div>
-    </div>
+    <div><div class="dlg-title">New project</div>
+    <div class="dlg-sub">Will be live at <code id="newHint">/myapp/</code></div></div>
   </div>
   <form id="newForm">
     <div class="dlg-body">
-      <div class="field">
-        <label for="pName"><i class="fa-solid fa-tag"></i>Project name</label>
+      <div class="field"><label for="pName"><i class="fa-solid fa-tag"></i>Project name</label>
         <input id="pName" class="input" required placeholder="myapp" pattern="[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?">
-        <div class="fhint"><i class="fa-solid fa-circle-info"></i>Lowercase, numbers, dashes. Becomes the subdomain.</div>
-      </div>
-      <div class="field">
-        <label for="pRepo"><i class="fa-brands fa-github"></i>Git repository URL</label>
+        <div class="fhint"><i class="fa-solid fa-circle-info"></i>Lowercase, numbers, dashes. Becomes the URL path.</div></div>
+      <div class="field"><label for="pRepo"><i class="fa-brands fa-github"></i>Git repository URL</label>
         <input id="pRepo" class="input" placeholder="https://github.com/user/repo.git">
-        <div class="fhint"><i class="fa-solid fa-circle-info"></i>Leave blank to deploy a placeholder app.</div>
-      </div>
-      <div class="field">
-        <label for="pInstall"><i class="fa-solid fa-download"></i>Install command</label>
+        <div class="fhint"><i class="fa-solid fa-circle-info"></i>Leave blank to deploy a placeholder app.</div></div>
+      <div class="field"><label for="pInstall"><i class="fa-solid fa-download"></i>Install command</label>
         <input id="pInstall" class="input" value="npm install">
-      </div>
-      <div class="field">
-        <label for="pStart"><i class="fa-solid fa-play"></i>Start command</label>
-        <input id="pStart" class="input" value="npm start" required>
-      </div>
-      <div class="field">
-        <label for="pEnv"><i class="fa-solid fa-sliders"></i>Environment variables</label>
+        <div class="fhint"><i class="fa-solid fa-bolt"></i>Auto-optimized: uses <code>npm ci --omit=dev</code> when possible.</div></div>
+      <div class="field"><label for="pStart"><i class="fa-solid fa-play"></i>Start command</label>
+        <input id="pStart" class="input" value="npm start" required></div>
+      <div class="field"><label for="pEnv"><i class="fa-solid fa-sliders"></i>Environment variables</label>
         <textarea id="pEnv" class="input" rows="5" spellcheck="false" placeholder="NODE_ENV=production&#10;DATABASE_URL=postgres://localhost/db"></textarea>
-        <div class="fhint"><i class="fa-solid fa-circle-info"></i>KEY=value, one per line.</div>
-      </div>
+        <div class="fhint"><i class="fa-solid fa-circle-info"></i>KEY=value, one per line. <code>BASE_PATH</code> is set automatically.</div></div>
     </div>
     <div class="dlg-foot">
       <div class="err" id="newErr"></div>
       <div class="actions">
         <button type="button" class="btn btn-ghost" id="newCancel">Cancel</button>
-        <button type="submit" class="btn btn-primary" id="newSubmit">
-          <i class="fa-solid fa-rocket"></i>Create &amp; deploy
-        </button>
+        <button type="submit" class="btn btn-primary" id="newSubmit"><i class="fa-solid fa-bolt"></i>Create &amp; deploy</button>
       </div>
     </div>
   </form>
@@ -1346,9 +1317,7 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
     <div class="term-title"><i class="fa-solid fa-terminal"></i><span id="termTitle">logs</span></div>
     <div class="term-actions">
       <span class="term-live" id="termLive"><span class="term-live-dot"></span>Live</span>
-      <label class="term-follow" title="Follow output">
-        <input type="checkbox" id="autoScroll" checked><span>Follow</span>
-      </label>
+      <label class="term-follow"><input type="checkbox" id="autoScroll" checked><span>Follow</span></label>
       <button class="term-close" id="termClose" type="button"><i class="fa-solid fa-xmark"></i>Close</button>
     </div>
   </div>
@@ -1358,33 +1327,22 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 <script>
 (function(){
 'use strict';
-
 var HOST=location.hostname+(location.port?':'+location.port:'');
-var BD=location.hostname;
 function $(id){return document.getElementById(id);}
 function show(el,on){if(el)el.classList.toggle('hidden',!on);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
   return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-
 var toastTimer=null;
 function toast(msg,isErr){
   var old=document.querySelector('.toast');
   if(old&&old.parentNode)old.parentNode.removeChild(old);
-  var el=document.createElement('div');
-  el.className='toast';
-  el.innerHTML=
-    '<div class="toast-icon '+(isErr?'err':'ok')+'">'+
-      '<i class="fa-solid '+(isErr?'fa-circle-exclamation':'fa-circle-check')+'"></i>'+
-    '</div>'+
-    '<div>'+esc(msg)+'</div>';
-  document.body.appendChild(el);
-  clearTimeout(toastTimer);
+  var el=document.createElement('div');el.className='toast';
+  el.innerHTML='<div class="toast-icon '+(isErr?'err':'ok')+'"><i class="fa-solid '+(isErr?'fa-circle-exclamation':'fa-circle-check')+'"></i></div><div>'+esc(msg)+'</div>';
+  document.body.appendChild(el);clearTimeout(toastTimer);
   toastTimer=setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},3800);
 }
-
 function api(url,opts){
-  opts=opts||{};
-  opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  opts=opts||{};opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
   opts.credentials='same-origin';
   if(opts.body&&typeof opts.body!=='string')opts.body=JSON.stringify(opts.body);
   return fetch(url,opts).then(function(res){
@@ -1394,47 +1352,38 @@ function api(url,opts){
     });
   });
 }
-
 var user=null,authMode='login',projects=[],pollTimer=null;
 var currentProjectId=null,eventSource=null,partialLine='';
 var terminalEl=$('terminal'),termBody=$('termBody'),termTitle=$('termTitle');
 var termLive=$('termLive'),autoScroll=$('autoScroll');
-
 function setAuthMode(mode){
   authMode=mode;var isL=mode==='login';
-  $('tabLogin').classList.toggle('active',isL);
-  $('tabSignup').classList.toggle('active',!isL);
+  $('tabLogin').classList.toggle('active',isL);$('tabSignup').classList.toggle('active',!isL);
   $('authSubmitText').textContent=isL?'Log in':'Create account';
   $('password').autocomplete=isL?'current-password':'new-password';
   $('authErr').textContent='';
 }
 $('tabLogin').onclick=function(){setAuthMode('login');};
 $('tabSignup').onclick=function(){setAuthMode('signup');};
-
 $('authForm').onsubmit=function(e){
-  e.preventDefault();
-  var errEl=$('authErr');errEl.textContent='';
+  e.preventDefault();var errEl=$('authErr');errEl.textContent='';
   var btn=$('authSubmit');btn.disabled=true;
   var path=authMode==='login'?'/api/auth/login':'/api/auth/signup';
   api(path,{method:'POST',body:{email:$('email').value,password:$('password').value}})
-  .then(function(data){
-    user=data.user;$('email').value='';$('password').value='';
+  .then(function(data){user=data.user;$('email').value='';$('password').value='';
     renderAuth();return loadProjects();
   }).catch(function(err){errEl.textContent=err.message;})
   .then(function(){btn.disabled=false;});
 };
-
 $('logoutBtn').onclick=function(){
   api('/api/auth/logout',{method:'POST'}).catch(function(){}).then(function(){
     user=null;projects=[];closeTerminal();renderAuth();
   });
 };
-
 function renderAuth(){
   show($('topbar'),!!user);show($('dashView'),!!user);show($('authView'),!user);
   if(user){$('userEmail').textContent=user.email;$('userAv').textContent=user.email.charAt(0).toUpperCase();}
 }
-
 function loadProjects(){
   if(!user)return Promise.resolve();
   return api('/api/projects').then(function(data){
@@ -1444,10 +1393,7 @@ function loadProjects(){
     else console.error(err);
   });
 }
-
-function pUrl(n){return location.protocol+'//'+HOST+'/preview/'+n+'/';}
-function sUrl(n){return location.protocol+'//'+n+'.'+BD+(location.port?':'+location.port:'');}
-
+function appUrl(n){return location.protocol+'//'+HOST+'/'+n+'/';}
 function renderStats(){
   var t=projects.length,r=0,b=0,f=0;
   for(var i=0;i<projects.length;i++){
@@ -1455,77 +1401,45 @@ function renderStats(){
     if(projects[i].status==='building'||projects[i].status==='starting')b++;
     if(projects[i].status==='failed')f++;
   }
-  var root=$('statsRow');
-  if(!t){root.innerHTML='';return;}
+  var root=$('statsRow');if(!t){root.innerHTML='';return;}
   root.innerHTML=
-    '<div class="stat">'+
-      '<div class="stat-icon"><i class="fa-solid fa-cubes"></i></div>'+
-      '<div><div class="stat-val">'+t+'</div><div class="stat-lbl">Total</div></div>'+
-    '</div>'+
-    '<div class="stat">'+
-      '<div class="stat-icon ok"><i class="fa-solid fa-circle-play"></i></div>'+
-      '<div><div class="stat-val">'+r+'</div><div class="stat-lbl">Running</div></div>'+
-    '</div>'+
-    '<div class="stat">'+
-      '<div class="stat-icon wn"><i class="fa-solid fa-spinner"></i></div>'+
-      '<div><div class="stat-val">'+b+'</div><div class="stat-lbl">Building</div></div>'+
-    '</div>'+
-    '<div class="stat">'+
-      '<div class="stat-icon er"><i class="fa-solid fa-triangle-exclamation"></i></div>'+
-      '<div><div class="stat-val">'+f+'</div><div class="stat-lbl">Failed</div></div>'+
-    '</div>';
+    '<div class="stat"><div class="stat-icon"><i class="fa-solid fa-cubes"></i></div><div><div class="stat-val">'+t+'</div><div class="stat-lbl">Total</div></div></div>'+
+    '<div class="stat"><div class="stat-icon ok"><i class="fa-solid fa-circle-play"></i></div><div><div class="stat-val">'+r+'</div><div class="stat-lbl">Running</div></div></div>'+
+    '<div class="stat"><div class="stat-icon wn"><i class="fa-solid fa-spinner"></i></div><div><div class="stat-val">'+b+'</div><div class="stat-lbl">Building</div></div></div>'+
+    '<div class="stat"><div class="stat-icon er"><i class="fa-solid fa-triangle-exclamation"></i></div><div><div class="stat-val">'+f+'</div><div class="stat-lbl">Failed</div></div></div>';
 }
-
 function renderProjects(){
   var root=$('projects');
   if(!projects.length){
     root.className='';
-    root.innerHTML=
-      '<div class="empty">'+
-        '<div class="empty-icon"><i class="fa-solid fa-inbox"></i></div>'+
-        '<h3>No projects yet</h3>'+
-        '<p>Click <strong style="color:var(--tx-soft);font-weight:600;">New project</strong> to deploy your first app.</p>'+
-      '</div>';
+    root.innerHTML='<div class="empty"><div class="empty-icon"><i class="fa-solid fa-inbox"></i></div><h3>No projects yet</h3><p>Click <strong style="color:var(--tx-soft);font-weight:600;">New project</strong> to deploy your first app.</p></div>';
     return;
   }
-  root.className='grid';
-  var html='';
+  root.className='grid';var html='';
   for(var i=0;i<projects.length;i++){
     var p=projects[i],isR=p.status==='running';
-    html+=
-      '<div class="card" data-id="'+esc(p.id)+'">'+
-        '<div class="card-head">'+
-          '<div class="card-title">'+
-            '<div class="card-title-icon"><i class="fa-solid fa-cube"></i></div>'+
-            '<h3>'+esc(p.name)+'</h3>'+
-          '</div>'+
-          '<span class="badge '+esc(p.status)+'"><span class="badge-dot"></span>'+esc(p.status)+'</span>'+
-        '</div>'+
-        '<div class="urls">'+
-          '<div class="url"><i class="fa-solid fa-link"></i><a href="'+esc(pUrl(p.name))+'" target="_blank">'+esc(pUrl(p.name))+'</a></div>'+
-          '<div class="url"><i class="fa-solid fa-globe"></i><a href="'+esc(sUrl(p.name))+'" target="_blank">'+esc(sUrl(p.name))+'</a></div>'+
-        '</div>'+
-        '<div class="card-actions">'+
-          '<button class="btn btn-secondary sm" data-act="deploy"><i class="fa-solid fa-rocket"></i>Deploy</button>'+
-          (isR
-            ?'<button class="btn btn-ghost sm" data-act="stop"><i class="fa-solid fa-stop"></i>Stop</button>'
-            :'<button class="btn btn-ghost sm" data-act="restart"><i class="fa-solid fa-play"></i>Start</button>')+
-          '<button class="btn btn-ghost sm" data-act="logs"><i class="fa-solid fa-terminal"></i>Logs</button>'+
-          '<button class="btn btn-danger sm" data-act="delete"><i class="fa-solid fa-trash"></i></button>'+
-        '</div>'+
-      '</div>';
+    html+='<div class="card" data-id="'+esc(p.id)+'">'+
+      '<div class="card-head"><div class="card-title"><div class="card-title-icon"><i class="fa-solid fa-cube"></i></div><h3>'+esc(p.name)+'</h3></div>'+
+      '<span class="badge '+esc(p.status)+'"><span class="badge-dot"></span>'+esc(p.status)+'</span></div>'+
+      '<div class="urls">'+
+      '<div class="url"><i class="fa-solid fa-link"></i><a href="'+esc(appUrl(p.name))+'" target="_blank">'+esc(appUrl(p.name))+'</a><span class="tag">path</span></div>'+
+      '</div>'+
+      '<div class="card-actions">'+
+      '<button class="btn btn-secondary sm" data-act="deploy"><i class="fa-solid fa-bolt"></i>Deploy</button>'+
+      (isR?'<button class="btn btn-ghost sm" data-act="stop"><i class="fa-solid fa-stop"></i>Stop</button>'
+          :'<button class="btn btn-ghost sm" data-act="restart"><i class="fa-solid fa-play"></i>Start</button>')+
+      '<button class="btn btn-ghost sm" data-act="logs"><i class="fa-solid fa-terminal"></i>Logs</button>'+
+      '<button class="btn btn-danger sm" data-act="delete"><i class="fa-solid fa-trash"></i></button>'+
+      '</div></div>';
   }
   root.innerHTML=html;
 }
-
 $('projects').addEventListener('click',function(e){
-  var btn=e.target.closest('button[data-act]');
-  if(!btn)return;
+  var btn=e.target.closest('button[data-act]');if(!btn)return;
   var card=btn.closest('.card'),id=card.getAttribute('data-id');
   var act=btn.getAttribute('data-act'),proj=null;
   for(var i=0;i<projects.length;i++){if(projects[i].id===id){proj=projects[i];break;}}
   if(!proj)return;
-
   if(act==='deploy'){
     api('/api/projects/'+id+'/deploy',{method:'POST'})
     .then(function(){toast('Deploy started');openTerminal(id,proj.name);loadProjects();})
@@ -1549,48 +1463,37 @@ $('projects').addEventListener('click',function(e){
     else openTerminal(id,proj.name);
   }
 });
-
 function stripAnsi(s){return s.replace(/\x1b\[[0-9;]*m/g,'');}
 function classLine(l){
   var t=l.replace(/^\s+/,'');
   if(t.charAt(0)==='$')return'log-cmd';
   if(t.indexOf('[bdeploy]')===0)return'log-sys';
   if(/^error|^ERR!|failed|exception|throw /i.test(t))return'log-err';
-  if(/listening|ready on|live|started on|server running/i.test(t))return'log-ok';
-  if(/^warn|deprecated/i.test(t))return'log-info';
+  if(/listening|ready on|live at|started on|server running|✓ live/i.test(t))return'log-ok';
+  if(/^warn|deprecated|⚠/i.test(t))return'log-info';
   return'log-out';
 }
-
 function feedTerm(raw){
-  var chunk=stripAnsi(raw);
-  partialLine+=chunk;
-  var lines=partialLine.split('\n');
-  partialLine=lines.pop();
+  var chunk=stripAnsi(raw);partialLine+=chunk;
+  var lines=partialLine.split('\n');partialLine=lines.pop();
   var old=termBody.querySelector('.log-line.partial');
   if(old&&old.parentNode)old.parentNode.removeChild(old);
   var frag=document.createDocumentFragment();
   for(var i=0;i<lines.length;i++){
-    var div=document.createElement('div');
-    div.className='log-line '+classLine(lines[i]);
-    div.textContent=lines[i]||'\u00a0';
-    frag.appendChild(div);
+    var div=document.createElement('div');div.className='log-line '+classLine(lines[i]);
+    div.textContent=lines[i]||'\u00a0';frag.appendChild(div);
   }
   if(partialLine){
-    var d2=document.createElement('div');
-    d2.className='log-line partial '+classLine(partialLine);
-    d2.textContent=partialLine;
-    frag.appendChild(d2);
+    var d2=document.createElement('div');d2.className='log-line partial '+classLine(partialLine);
+    d2.textContent=partialLine;frag.appendChild(d2);
   }
   termBody.appendChild(frag);
   while(termBody.childNodes.length>4000)termBody.removeChild(termBody.firstChild);
   if(autoScroll.checked)termBody.scrollTop=termBody.scrollHeight;
 }
-
 function openTerminal(pid,pname){
-  closeTerminal();
-  currentProjectId=pid;partialLine='';termBody.innerHTML='';
-  termTitle.textContent=pname+' \u2014 logs';
-  terminalEl.classList.add('open');
+  closeTerminal();currentProjectId=pid;partialLine='';termBody.innerHTML='';
+  termTitle.textContent=pname+' \u2014 logs';terminalEl.classList.add('open');
   termLive.classList.remove('paused');
   termLive.innerHTML='<span class="term-live-dot"></span>Live';
   eventSource=new EventSource('/api/projects/'+pid+'/logs/stream',{withCredentials:true});
@@ -1603,7 +1506,6 @@ function openTerminal(pid,pname){
   eventSource.onopen=function(){termLive.classList.remove('paused');termLive.innerHTML='<span class="term-live-dot"></span>Live';};
   eventSource.onerror=function(){termLive.classList.add('paused');termLive.innerHTML='<span class="term-live-dot"></span>Reconnecting';};
 }
-
 function closeTerminal(){
   terminalEl.classList.remove('open');
   if(eventSource){eventSource.close();eventSource=null;}
@@ -1616,19 +1518,16 @@ termBody.addEventListener('scroll',function(){
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&terminalEl.classList.contains('open'))closeTerminal();
 });
-
 $('newProjectBtn').onclick=function(){
-  $('newHint').textContent='/preview/myapp/';$('newErr').textContent='';$('newDialog').showModal();
+  $('newHint').textContent='/myapp/';$('newErr').textContent='';$('newDialog').showModal();
 };
 $('newCancel').onclick=function(){$('newDialog').close();};
 $('newDialog').addEventListener('click',function(e){if(e.target===$('newDialog'))$('newDialog').close();});
 $('pName').addEventListener('input',function(){
-  $('newHint').textContent='/preview/'+(($('pName').value.trim().toLowerCase())||'myapp')+'/';
+  $('newHint').textContent='/'+(($('pName').value.trim().toLowerCase())||'myapp')+'/';
 });
-
 $('newForm').onsubmit=function(e){
-  e.preventDefault();
-  var errEl=$('newErr');errEl.textContent='';
+  e.preventDefault();var errEl=$('newErr');errEl.textContent='';
   var btn=$('newSubmit');btn.disabled=true;
   api('/api/projects',{method:'POST',body:{
     name:$('pName').value.trim().toLowerCase(),
@@ -1646,14 +1545,13 @@ $('newForm').onsubmit=function(e){
   }).catch(function(err){errEl.textContent=err.message;})
   .then(function(){btn.disabled=false;});
 };
-
 setAuthMode('login');
 api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(function(){
   renderAuth();if(user)return loadProjects();
 }).then(function(){
   pollTimer=setInterval(function(){
     if(user&&document.visibilityState==='visible')loadProjects();
-  },5000);
+  },3000);
 });
 })();
 </script>
@@ -1663,44 +1561,198 @@ api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(fun
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 
 /* ============================================================
- * Proxy
+ * Reverse proxy — path-based with HTML rewriting
  * ============================================================ */
 
-const proxy = httpProxy.createProxyServer({ xfwd: true, ws: true });
+const proxy = httpProxy.createProxyServer({
+  xfwd: true,
+  ws: true,
+  selfHandleResponse: true,  // we handle the response to rewrite HTML
+  changeOrigin: true,
+});
+
+// Force upstream to send uncompressed so we can rewrite safely
+proxy.on('proxyReq', (proxyReq) => {
+  proxyReq.setHeader('Accept-Encoding', 'identity');
+});
+
+/**
+ * Rewrite absolute-path URLs in HTML so client-side navigation works
+ * under a sub-path deployment.
+ *
+ *   <a href="/login">          →  <a href="/myapp/login">
+ *   <script src="/app.js">     →  <script src="/myapp/app.js">
+ *   <form action="/submit">    →  <form action="/myapp/submit">
+ *   url("/img.png")            →  url("/myapp/img.png")
+ *
+ * Also injects <base href="/myapp/"> so relative URLs resolve correctly.
+ * Protocol-relative URLs (//cdn.com/...) are left alone.
+ */
+function rewriteHtml(html, projectName) {
+  const prefix = '/' + projectName;
+  const baseHref = prefix + '/';
+
+  // 1. Inject <base> if the app didn't already set one
+  if (/<head[\s>]/i.test(html) && !/<base[\s>]/i.test(html)) {
+    html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<base href="' + baseHref + '">');
+  }
+
+  // 2. Rewrite absolute-path attributes. \b prevents matching inside
+  //    longer words, (?!\/) prevents matching protocol-relative //...
+  const attrRe = /\b(href|src|action|poster)\s*=\s*(["'])\/(?!\/)/gi;
+  html = html.replace(attrRe, (_m, attr, q) => attr + '=' + q + prefix + '/');
+
+  // 3. Rewrite url(/...) in inline styles and <style> blocks
+  html = html.replace(/url\(\s*(["']?)\/(?!\/)/gi, (_m, q) => 'url(' + q + prefix + '/');
+
+  return html;
+}
+
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  const projectName = req._projectName;
+
+  // Rewrite Location headers on redirects — /home → /myapp/home
+  if (projectName && proxyRes.headers.location) {
+    const loc = proxyRes.headers.location;
+    if (typeof loc === 'string' && loc.startsWith('/') && !loc.startsWith('//')) {
+      proxyRes.headers.location = '/' + projectName + loc;
+    }
+  }
+
+  const ct = (proxyRes.headers['content-type'] || '').toLowerCase();
+  const isHtml = /text\/html/i.test(ct);
+
+  if (!projectName || !isHtml) {
+    // Pass through as-is
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+    return;
+  }
+
+  // Buffer HTML, rewrite, send
+  const chunks = [];
+  proxyRes.on('data', (c) => chunks.push(c));
+  proxyRes.on('end', () => {
+    let body = Buffer.concat(chunks).toString('utf8');
+    try {
+      body = rewriteHtml(body, projectName);
+    } catch (e) {
+      console.error('[rewrite]', e.message);
+    }
+    const headers = { ...proxyRes.headers };
+    delete headers['content-length'];
+    headers['content-length'] = String(Buffer.byteLength(body, 'utf8'));
+    res.writeHead(proxyRes.statusCode, headers);
+    res.end(body);
+  });
+  proxyRes.on('error', (err) => {
+    console.error('[proxyRes]', err.message);
+    if (!res.headersSent) res.writeHead(502);
+    res.end('proxy stream error');
+  });
+});
+
 proxy.on('error', (err, req, res) => {
   console.error('[proxy]', err.message);
   if (!res) return;
   if (typeof res.writeHead === 'function' && !res.headersSent)
     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-  if (typeof res.end === 'function') res.end('502 Bad Gateway');
+  if (typeof res.end === 'function') res.end('502 Bad Gateway — app not responding');
 });
 
-app.use('/preview/:name', async (req, res) => {
+/* ---------- Legacy /preview/:name (kept for backward compat) ---------- */
+
+app.use('/preview/:name', async (req, res, next) => {
   const name = String(req.params.name || '').toLowerCase();
   const project = await Project.findOne({ name });
-  if (!project) return res.status(404).send('No project "' + name + '"');
+  if (!project) return next();
   const rt = running.get(String(project._id));
-  if (!rt) return res.status(503).send('"' + name + '" not running (' + project.status + ')');
+  if (!rt) {
+    return res.status(503).type('html').send(notRunningHtml(name, project.status));
+  }
   req.url = req.originalUrl.replace(/^\/preview\/[^/]+/, '') || '/';
+  req._projectName = name;
   proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
 });
+
+/* ---------- NEW: /<project-name>/... primary path-based routing ----- */
+
+app.use(async (req, res, next) => {
+  // Skip if no path segments
+  const parts = req.path.split('/').filter(Boolean);
+  if (!parts.length) return next();
+
+  const name = parts[0].toLowerCase();
+
+  // Fast reject: not a project name → fall through to 404
+  if (!projectNames.has(name)) return next();
+
+  // Look up the project
+  const project = await Project.findOne({ name });
+  if (!project) {
+    projectNames.delete(name);  // stale cache
+    return next();
+  }
+
+  const rt = running.get(String(project._id));
+  if (!rt) {
+    return res.status(503).type('html').send(notRunningHtml(name, project.status));
+  }
+
+  // Strip /<name> prefix so the app sees /login, /api/..., etc.
+  req.url = req.originalUrl.replace(/^\/[^/]+/, '') || '/';
+  req._projectName = name;
+  proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
+});
+
+/* ---------- Not-running page ---------- */
+
+function notRunningHtml(name, status) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${name} — offline</title>
+<style>
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#09090b;color:#a1a1aa;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:40px;}
+.box{max-width:520px;text-align:center;border:1px solid #27272a;background:#111114;
+  padding:48px 40px;border-radius:12px;}
+h1{font-size:22px;color:#fafafa;margin:0 0 12px;font-weight:600;}
+p{margin:8px 0;line-height:1.6;}
+code{font-family:ui-monospace,Menlo,monospace;background:#18181b;padding:2px 6px;
+  border-radius:4px;color:#e4e4e7;}
+.badge{display:inline-block;padding:4px 10px;border-radius:100px;font-size:11px;
+  text-transform:uppercase;letter-spacing:.08em;font-weight:600;
+  background:rgba(245,158,11,.1);color:#f59e0b;border:1px solid rgba(245,158,11,.25);
+  margin-bottom:16px;}
+a{color:#60a5fa;text-decoration:none;}
+a:hover{text-decoration:underline;}
+</style></head>
+<body><div class="box">
+<span class="badge">${status}</span>
+<h1>This app is not running</h1>
+<p>Project <code>${name}</code> is currently <strong>${status}</strong>.</p>
+<p>Go to the <a href="/">dashboard</a> to start it.</p>
+</div></body></html>`;
+}
+
+/* ---------- 404 for everything else ---------- */
 
 app.use((req, res) => {
   res.status(404).type('html').send(
     '<!doctype html><meta charset="utf-8"><title>404</title>' +
     '<body style="font-family:system-ui;background:#09090b;color:#a1a1aa;padding:60px;text-align:center;">' +
     '<h1 style="font-size:64px;color:#e4e4e7;margin:0;">404</h1>' +
-    '<p>Nothing here.</p>' +
-    '<p><a href="/" style="color:#d4d4d8;">Back to dashboard</a></p></body>'
+    '<p>Nothing here.</p><p><a href="/" style="color:#d4d4d8;">Back to dashboard</a></p></body>'
   );
 });
 
-// Central error handler — must be last
 app.use((err, req, res, next) => {
   console.error('[express]', err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+/* ============================================================
+ * Subdomain handler (optional, custom domain only)
+ * ============================================================ */
 
 function getSubdomain(hostHeader) {
   if (!hostHeader) return null;
@@ -1719,10 +1771,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const sub = getSubdomain(req.headers.host);
     if (!sub) return app(req, res);
+
+    // Subdomain deployment: app runs at root, no rewriting needed
     const project = await Project.findOne({ name: sub });
     if (!project) return sendPlain(res, 404, '404 - no app "' + sub + '"');
     const rt = running.get(String(project._id));
     if (!rt) return sendPlain(res, 503, '503 - "' + sub + '" not running (' + project.status + ')');
+
+    req._projectName = null;   // signals proxyRes: skip rewriting
     proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
   } catch (err) {
     console.error('[server]', err);
@@ -1732,11 +1788,27 @@ const server = http.createServer(async (req, res) => {
 
 server.on('upgrade', async (req, socket, head) => {
   try {
+    // WebSocket for subdomain
     const sub = getSubdomain(req.headers.host);
-    if (!sub) return socket.destroy();
-    const project = await Project.findOne({ name: sub });
+    if (sub) {
+      const project = await Project.findOne({ name: sub });
+      const rt = project && running.get(String(project._id));
+      if (!rt) return socket.destroy();
+      return proxy.ws(req, socket, head, { target: 'ws://127.0.0.1:' + rt.port });
+    }
+
+    // WebSocket for path-based (/myapp/ws)
+    const parts = req.url.split('?')[0].split('/').filter(Boolean);
+    if (!parts.length) return socket.destroy();
+    const name = parts[0].toLowerCase();
+    if (!projectNames.has(name)) return socket.destroy();
+
+    const project = await Project.findOne({ name });
     const rt = project && running.get(String(project._id));
     if (!rt) return socket.destroy();
+
+    // Strip /<name> prefix
+    req.url = '/' + parts.slice(1).join('/');
     proxy.ws(req, socket, head, { target: 'ws://127.0.0.1:' + rt.port });
   } catch (e) { socket.destroy(); }
 });
@@ -1751,11 +1823,8 @@ async function connectMongo(retries) {
     try {
       console.log('  MongoDB    …  connecting (attempt ' + attempt + '/' + retries + ')');
       await mongoose.connect(MONGO_URI, {
-        serverSelectionTimeoutMS: 30000,
-        socketTimeoutMS: 45000,
-        connectTimeoutMS: 30000,
-        family: 4,
-        maxPoolSize: 5,
+        serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000,
+        connectTimeoutMS: 30000, family: 4, maxPoolSize: 5,
       });
       console.log('  MongoDB    ✓  connected');
       return;
@@ -1774,16 +1843,11 @@ async function boot() {
   console.log('  MiniDeploy — booting');
   console.log('  ──────────────────────────────────────────');
 
-  // Security posture checks
-  if (INVITE_ONLY) {
-    console.log('  Invite     ✓  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
-  } else {
-    console.log('  Invite     ⚠  OPEN SIGNUP — anyone can register');
-    console.log('             Set ALLOWED_EMAILS to restrict');
-  }
+  if (INVITE_ONLY) console.log('  Invite     ✓  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
+  else { console.log('  Invite     ⚠  OPEN SIGNUP'); console.log('             Set ALLOWED_EMAILS to restrict'); }
 
   if (process.platform !== 'win32' && process.getuid && process.getuid() === 0) {
-    console.warn('  Runtime    ⚠  running as root — deployed apps will too');
+    console.warn('  Runtime    ⚠  running as root');
   }
 
   try {
@@ -1791,7 +1855,7 @@ async function boot() {
     console.log('  resolving  ' + host + ' …');
     const addrs = await dns.promises.resolveSrv('_mongodb._tcp.' + host).catch(() => null);
     if (addrs && addrs.length) console.log('  SRV        ✓  ' + addrs.length + ' target(s) resolved');
-    else console.log('  SRV        ·  no SRV records (will try direct host)');
+    else console.log('  SRV        ·  no SRV records');
   } catch (e) { console.log('  DNS probe skipped:', e.message); }
 
   await connectMongo(5);
@@ -1804,58 +1868,48 @@ async function boot() {
     else console.warn('  B2         ⚠  ' + e.message);
   }
   console.log('  B2 bucket  ✓  ' + B2_BUCKET_NAME);
+  console.log('  npm cache  ✓  ' + NPM_CACHE_DIR);
+
+  // Preload project names for path routing
+  try {
+    const names = await Project.find({}, 'name').lean();
+    for (const p of names) projectNames.add(p.name);
+    console.log('  Projects   ✓  ' + projectNames.size + ' name(s) cached');
+  } catch (e) {
+    console.warn('  Projects   ⚠  could not load names:', e.message);
+  }
 
   server.listen(PORT, () => {
     console.log('');
-    console.log('  MiniDeploy running');
+    console.log('  MiniDeploy running  (path-based routing)');
     console.log('  ──────────────────────────────────────────');
-    console.log('  Dashboard :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT));
+    console.log('  Dashboard :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/');
     console.log('  Health    :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/health');
-    console.log('  Preview   :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/preview/<name>/');
-    console.log('  Subdomain :  http://<name>.' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT));
+    console.log('  Apps      :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/');
+    console.log('  App routes:  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/login → app sees /login');
     console.log('  App ports :  ' + APP_PORT_START + ' – ' + APP_PORT_END);
-    console.log('  Temp dir  :  ' + TEMP_ROOT);
+    console.log('  Timeouts  :  git ' + (GIT_TIMEOUT_MS / 1000) + 's, install idle ' + (INSTALL_IDLE_MS / 1000) + 's / max ' + (INSTALL_MAX_MS / 1000) + 's');
     console.log('');
-
     setTimeout(() => autoStartProjects().catch((err) => console.error('[boot]', err)), 2000);
   });
 }
 
 boot().catch((err) => {
   console.error('');
-  console.error('  FATAL: boot failed');
-  console.error('  ' + err.message);
-  console.error('');
-  console.error('  Common causes:');
-  console.error('    1. MongoDB Atlas IP allowlist — add 0.0.0.0/0 (or Render IPs)');
-  console.error('    2. Wrong password in MONGO_URI');
-  console.error('    3. Database user has no access to the "node" database');
+  console.error('  FATAL: boot failed — ' + err.message);
   console.error('');
   process.exit(1);
 });
-
-/* ============================================================
- * Shutdown
- * ============================================================ */
 
 let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('\n' + signal + ': shutting down gracefully…');
-
-  for (const [id] of running) {
-    try { stopProject(id, { silent: true }); } catch (e) {}
-  }
-
+  for (const [id] of running) { try { stopProject(id, { silent: true }); } catch (e) {} }
   for (const [pid, buf] of logBuffers) {
-    LogEntry.findOneAndUpdate(
-      { project_id: pid },
-      { content: buf },
-      { upsert: true }
-    ).catch(() => {});
+    LogEntry.findOneAndUpdate({ project_id: pid }, { content: buf }, { upsert: true }).catch(() => {});
   }
-
   mongoose.disconnect().catch(() => {});
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 8000).unref();
@@ -1864,7 +1918,4 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (err) => console.error('[unhandled]', err));
-process.on('uncaughtException', (err) => {
-  console.error('[uncaught]', err);
-  shutdown('uncaughtException');
-});
+process.on('uncaughtException', (err) => { console.error('[uncaught]', err); shutdown('uncaughtException'); });
