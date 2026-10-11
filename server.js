@@ -56,8 +56,8 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 const B2_REGION = process.env.B2_REGION || 'us-east-005';
 const B2_FOLDER = process.env.B2_FOLDER || 'bdeploy';
 
-// ── AI (Groq) ──
-const GROQ_API_KEY = process.env.GROQ_API_KEY ;
+// ── AI (Groq) — read from env only, no hardcoded fallback ──
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const AI_ENABLED = !!GROQ_API_KEY;
@@ -294,7 +294,7 @@ function serializeProject(p) {
 }
 
 /* ============================================================
- * AI source inspection (safe, bounded)
+ * AI source inspection
  * ============================================================ */
 
 const IGNORED_DIRS = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.cache', '.npm', 'tmp']);
@@ -396,16 +396,16 @@ const AI_SYSTEM_PROMPT = [
   '- Build timeout: git 2m, npm install 6m max / 90s idle. App has 45s to bind its port.',
   '',
   'Common failures and how to explain them:',
-  '- "Cannot find module X" → dependency missing or not in dependencies (only devDependencies).',
-  '- App never binds port → forgot to read process.env.PORT, or bound to 127.0.0.1.',
-  '- EADDRINUSE → app hardcoded a port.',
-  '- Client-side routes 404 → router needs basename=PUBLIC_PATH or use relative links.',
-  '- Assets 404 → uses absolute /path instead of ./path or BASE_PATH.',
+  '- "Cannot find module X" -> dependency missing or not in dependencies (only devDependencies).',
+  '- App never binds port -> forgot to read process.env.PORT, or bound to 127.0.0.1.',
+  '- EADDRINUSE -> app hardcoded a port.',
+  '- Client-side routes 404 -> router needs basename=PUBLIC_PATH or use relative links.',
+  '- Assets 404 -> uses absolute /path instead of ./path or BASE_PATH.',
   '',
   'Style:',
   '- Be concise. No filler, no apologies, no "great question".',
   '- Lead with the root cause, then the fix.',
-  '- Use markdown. Wrap code in ``` with language.',
+  '- Use markdown. Wrap code in triple backticks with language.',
   '- If the fix is a code change, show the exact snippet.',
   '- If you cannot determine the cause from the context, say so and ask ONE targeted question.',
   '- Never invent log lines or file contents you were not given.',
@@ -446,9 +446,7 @@ function buildProjectContext(project, opts) {
     if (content) {
       parts.push('');
       parts.push('Contents of ' + opts.includeFile + ':');
-      parts.push('```');
       parts.push(content);
-      parts.push('```');
     }
   }
 
@@ -457,9 +455,7 @@ function buildProjectContext(project, opts) {
     const tail = logs.slice(-9000);
     parts.push('');
     parts.push('=== RECENT LOGS (last ~9KB) ===');
-    parts.push('```');
     parts.push(tail);
-    parts.push('```');
   }
 
   return parts.join('\n');
@@ -758,7 +754,7 @@ async function deployProject(projectId) {
 
   await Project.findByIdAndUpdate(projectId, { status: 'building' });
   logBuffers.set(projectId, '');
-  appendLog(projectId, '[bdeploy] ⚡ fast deploy started ' + new Date().toISOString() + '\n');
+  appendLog(projectId, '[bdeploy] fast deploy started ' + new Date().toISOString() + '\n');
 
   const src = sourceDir(projectId);
   const t0 = Date.now();
@@ -812,19 +808,19 @@ async function deployProject(projectId) {
     });
 
   } catch (err) {
-    appendLog(projectId, '\n[bdeploy] ✗ DEPLOY FAILED: ' + err.message + '\n');
+    appendLog(projectId, '\n[bdeploy] DEPLOY FAILED: ' + err.message + '\n');
     await Project.findByIdAndUpdate(projectId, { status: 'failed' });
   }
 }
 
 async function archiveToB2Background(projectId, src) {
   try {
-    appendLog(projectId, '\n[bdeploy] 📦 archiving to B2 (background)\n');
+    appendLog(projectId, '\n[bdeploy] archiving to B2 (background)\n');
     await uploadToB2(projectId, src);
     await Project.findByIdAndUpdate(projectId, { has_b2_archive: true, last_deploy: new Date() });
-    appendLog(projectId, '[bdeploy] ✓ archived to B2\n');
+    appendLog(projectId, '[bdeploy] archived to B2\n');
   } catch (err) {
-    appendLog(projectId, '[bdeploy] ⚠ B2 upload failed: ' + err.message + '\n');
+    appendLog(projectId, '[bdeploy] B2 upload failed: ' + err.message + '\n');
   }
 }
 
@@ -906,18 +902,16 @@ app.get('/health', (req, res) => {
     running: running.size,
     projects: projectNames.size,
     ai: AI_ENABLED ? 'enabled' : 'disabled',
-    version: '1.3.0',
+    version: '1.3.1',
   });
 });
-
-/* ---------- Auth routes ---------- */
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
     const email = String((req.body && req.body.email) || '').trim().toLowerCase();
     const password = String((req.body && req.body.password) || '');
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be ≥8 characters' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     if (password.length > 200) return res.status(400).json({ error: 'Password too long' });
     if (INVITE_ONLY && !ALLOWED_EMAILS.includes(email)) return res.status(403).json({ error: 'Not on the invite list' });
     if (await User.findOne({ email })) return res.status(409).json({ error: 'Email already registered' });
@@ -949,17 +943,10 @@ app.get('/api/auth/me', async (req, res) => {
   res.json({ user: { id: String(user._id), email: user.email } });
 });
 
-/* ---------- AI endpoints ---------- */
-
 app.get('/api/ai/status', requireAuth, (req, res) => {
   res.json({ enabled: AI_ENABLED, model: GROQ_MODEL });
 });
 
-/**
- * Chat about a specific project. Injects logs + file tree into context.
- *
- * Body: { message: string, history?: [{role, content}], file?: string }
- */
 app.post('/api/projects/:id/ai', requireAuth, aiLimiter, async (req, res) => {
   try {
     if (!AI_ENABLED) return res.status(503).json({ error: 'AI not configured (set GROQ_API_KEY)' });
@@ -973,7 +960,6 @@ app.post('/api/projects/:id/ai', requireAuth, aiLimiter, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Message required' });
     if (message.length > 4000) return res.status(400).json({ error: 'Message too long (max 4000 chars)' });
 
-    // Bounded conversation history (last 6 turns)
     const history = Array.isArray(body.history) ? body.history.slice(-6) : [];
     const cleanHistory = history
       .filter((h) => h && typeof h === 'object' && typeof h.content === 'string')
@@ -991,22 +977,13 @@ app.post('/api/projects/:id/ai', requireAuth, aiLimiter, async (req, res) => {
     ];
 
     const result = await callGroq(messages, { temperature: 0.25, maxTokens: 1400 });
-    res.json({
-      reply: result.reply,
-      model: result.model,
-      usage: result.usage,
-    });
+    res.json({ reply: result.reply, model: result.model, usage: result.usage });
   } catch (err) {
     console.error('[ai:project]', err.message);
     res.status(500).json({ error: 'AI request failed: ' + err.message });
   }
 });
 
-/**
- * General chat without project context.
- *
- * Body: { message: string, history?: [{role, content}] }
- */
 app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
   try {
     if (!AI_ENABLED) return res.status(503).json({ error: 'AI not configured (set GROQ_API_KEY)' });
@@ -1037,8 +1014,6 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     res.status(500).json({ error: 'AI request failed: ' + err.message });
   }
 });
-
-/* ---------- Projects API ---------- */
 
 app.get('/api/projects', requireAuth, async (req, res) => {
   const list = await Project.find({ user_id: req.user.id }).sort({ createdAt: -1 }).lean();
@@ -1550,6 +1525,49 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   font-size:10.5px;font-family:inherit;letter-spacing:inherit;}
 .ai-clear:hover{color:var(--tx-soft);}
 
+.terminal{position:fixed;left:0;right:0;bottom:0;height:60vh;background:#050507;
+  border-top:1px solid var(--bd-strong);display:flex;flex-direction:column;
+  transform:translateY(110%);transition:transform .32s cubic-bezier(.4,0,.2,1);
+  z-index:200;box-shadow:0 -32px 64px -20px rgba(0,0,0,.85);}
+.terminal.open{transform:translateY(0);}
+.term-head{display:flex;align-items:center;gap:14px;padding:12px 18px;
+  background:linear-gradient(180deg,#0b0b0e 0%,#08080a 100%);
+  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:12px;}
+.term-dots{display:flex;gap:8px;}
+.term-dots span{width:12px;height:12px;border-radius:50%;display:inline-block;}
+.term-dots .d1{background:#ff5f57;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
+.term-dots .d2{background:#febc2e;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
+.term-dots .d3{background:#28c840;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
+.term-title{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;
+  color:var(--tx-mut);font-family:var(--mono);font-size:11.5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.term-title i{color:var(--tx-dim);font-size:10px;}
+.term-actions{display:flex;align-items:center;gap:14px;font-size:11.5px;color:var(--tx-mut);}
+.term-live{display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:9.5px;font-weight:600;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--ok);}
+.term-live-dot{width:6px;height:6px;border-radius:50%;background:currentColor;
+  box-shadow:0 0 8px currentColor;animation:pulse 1.5s ease-in-out infinite;}
+.term-live.paused{color:var(--tx-dim);}
+.term-live.paused .term-live-dot{box-shadow:none;animation:none;}
+.term-follow{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+  user-select:none;color:var(--tx-mut);font-family:var(--mono);font-size:11px;}
+.term-follow input{width:auto;accent-color:#71717a;cursor:pointer;transform:scale(.9);}
+.term-close{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;
+  background:var(--surface);border:1px solid var(--bd);border-radius:6px;
+  color:var(--tx-mut);font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.05em;text-transform:uppercase;transition:all .15s;}
+.term-close:hover{color:var(--tx);border-color:var(--bd-strong);background:var(--raised);}
+.term-body{flex:1;margin:0;padding:18px 22px 32px;overflow-y:auto;
+  font-family:var(--mono);font-size:12.5px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-word;background:#050507;color:var(--tx-soft);}
+.term-body::-webkit-scrollbar-thumb{background:#1c1c21;border-color:#050507;}
+.log-line{display:block;min-height:1em;}
+.log-line.partial::after{content:'▋';margin-left:2px;color:var(--tx-dim);
+  animation:blink 1s steps(2,start) infinite;}
+@keyframes blink{to{opacity:0}}
+.log-cmd{color:#86efac;}.log-err{color:#fca5a5;}.log-sys{color:var(--tx-mut);}
+.log-ok{color:#93c5fd;}.log-info{color:#fde68a;}.log-out{color:var(--tx-soft);}
 @media(max-width:640px){
   .topbar-in,.container{padding:0 20px;}
   .page-head{flex-direction:column;align-items:stretch;gap:16px;}
@@ -1625,18 +1643,18 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
         <div class="fhint"><i class="fa-solid fa-circle-info"></i>Leave blank to deploy a placeholder app.</div></div>
       <div class="field"><label for="pInstall"><i class="fa-solid fa-download"></i>Install command</label>
         <input id="pInstall" class="input" value="npm install">
-        <div class="fhint"><i class="fa-solid fa-bolt"></i>Auto-optimized: uses <code>npm ci --omit=dev</code> when possible.</div></div>
+        <div class="fhint"><i class="fa-solid fa-bolt"></i>Auto-optimized: uses npm ci with --omit=dev when possible.</div></div>
       <div class="field"><label for="pStart"><i class="fa-solid fa-play"></i>Start command</label>
         <input id="pStart" class="input" value="npm start" required></div>
       <div class="field"><label for="pEnv"><i class="fa-solid fa-sliders"></i>Environment variables</label>
         <textarea id="pEnv" class="input" rows="5" spellcheck="false" placeholder="NODE_ENV=production&#10;DATABASE_URL=postgres://localhost/db"></textarea>
-        <div class="fhint"><i class="fa-solid fa-circle-info"></i>KEY=value, one per line. <code>BASE_PATH</code> is set automatically.</div></div>
+        <div class="fhint"><i class="fa-solid fa-circle-info"></i>KEY=value, one per line. BASE_PATH is set automatically.</div></div>
     </div>
     <div class="dlg-foot">
       <div class="err" id="newErr"></div>
       <div class="actions">
         <button type="button" class="btn btn-ghost" id="newCancel">Cancel</button>
-        <button type="submit" class="btn btn-primary" id="newSubmit"><i class="fa-solid fa-bolt"></i>Create &amp; deploy</button>
+        <button type="submit" class="btn btn-primary" id="newSubmit"><i class="fa-solid fa-bolt"></i>Create and deploy</button>
       </div>
     </div>
   </form>
@@ -1655,12 +1673,10 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   <pre class="term-body" id="termBody"></pre>
 </div>
 
-<!-- AI FAB -->
-<button class="ai-fab hidden" id="aiFab" title="Ask AI Assistant">
+<button class="ai-fab hidden" id="aiFab" title="Ask AI Assistant" type="button">
   <i class="fa-solid fa-wand-magic-sparkles"></i>
 </button>
 
-<!-- AI Panel -->
 <aside class="ai-panel" id="aiPanel" aria-hidden="true">
   <div class="ai-head">
     <div class="ai-head-left">
@@ -1714,16 +1730,23 @@ function api(url,opts){
     });
   });
 }
-/* Tiny markdown renderer — safe for AI output */
+
+/* Tiny markdown renderer — avoids literal backticks in source */
 function renderMarkdown(text){
-  var s=String(text||'').replace(/[&<>]/g,function(c){
-    return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});
+  var BQ=String.fromCharCode(96);            // backtick char
+  var FENCE=BQ+BQ+BQ;
+  var s=String(text==null?'':text).replace(/[&<>]/g,function(c){
+    return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';
+  });
   var blocks=[];
-  s=s.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g,function(_,code){
-    var i=blocks.length;blocks.push('<pre><code>'+code.replace(/\n$/,'')+'</code></pre>');
+  var fenceRe=new RegExp(FENCE+'[a-zA-Z0-9_-]*\\n?([\\s\\S]*?)'+FENCE,'g');
+  s=s.replace(fenceRe,function(_,code){
+    var i=blocks.length;
+    blocks.push('<pre><code>'+code.replace(/\n$/,'')+'</code></pre>');
     return '\u0001B'+i+'\u0001';
   });
-  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  var inlineRe=new RegExp(BQ+'([^'+BQ+'\\n]+)'+BQ,'g');
+  s=s.replace(inlineRe,'<code>$1</code>');
   s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
   s=s.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
   s=s.replace(/\n/g,'<br>');
@@ -1736,12 +1759,11 @@ var currentProjectId=null,eventSource=null,partialLine='';
 var terminalEl=$('terminal'),termBody=$('termBody'),termTitle=$('termTitle');
 var termLive=$('termLive'),autoScroll=$('autoScroll');
 
-/* ---------- AI state ---------- */
-var aiProjectId=null;       // null = general chat
+var aiProjectId=null;
 var aiProjectName=null;
-var aiHistory=[];           // [{role, content}]
+var aiHistory=[];
 var aiBusy=false;
-var aiEnabled=true;         // updated from /api/ai/status
+var aiEnabled=true;
 
 function setAuthMode(mode){
   authMode=mode;var isL=mode==='login';
@@ -1769,7 +1791,7 @@ $('logoutBtn').onclick=function(){
 };
 function renderAuth(){
   show($('topbar'),!!user);show($('dashView'),!!user);show($('authView'),!user);
-  show($('aiFab'),!!user);
+  show($('aiFab'),!!user&&aiEnabled);
   if(user){$('userEmail').textContent=user.email;$('userAv').textContent=user.email.charAt(0).toUpperCase();}
 }
 function loadProjects(){
@@ -1813,7 +1835,7 @@ function renderProjects(){
       '<div class="url"><i class="fa-solid fa-link"></i><a href="'+esc(appUrl(p.name))+'" target="_blank">'+esc(appUrl(p.name))+'</a><span class="tag">path</span></div>'+
       '</div>'+
       '<div class="card-actions">'+
-      '<button class="btn btn-ai sm" data-act="ask"><i class="fa-solid fa-wand-magic-sparkles"></i>Ask AI</button>'+
+      (aiEnabled?'<button class="btn btn-ai sm" data-act="ask"><i class="fa-solid fa-wand-magic-sparkles"></i>Ask AI</button>':'')+
       '<button class="btn btn-secondary sm" data-act="deploy"><i class="fa-solid fa-bolt"></i>Deploy</button>'+
       (isR?'<button class="btn btn-ghost sm" data-act="stop"><i class="fa-solid fa-stop"></i>Stop</button>'
           :'<button class="btn btn-ghost sm" data-act="restart"><i class="fa-solid fa-play"></i>Start</button>')+
@@ -1861,8 +1883,8 @@ function classLine(l){
   if(t.charAt(0)==='$')return'log-cmd';
   if(t.indexOf('[bdeploy]')===0)return'log-sys';
   if(/^error|^ERR!|failed|exception|throw /i.test(t))return'log-err';
-  if(/listening|ready on|live at|started on|server running|✓ live/i.test(t))return'log-ok';
-  if(/^warn|deprecated|⚠/i.test(t))return'log-info';
+  if(/listening|ready on|live at|started on|server running|live at/i.test(t))return'log-ok';
+  if(/^warn|deprecated/i.test(t))return'log-info';
   return'log-out';
 }
 function feedTerm(raw){
@@ -1921,19 +1943,15 @@ var aiSend=$('aiSend');
 var aiContextLabel=$('aiContextLabel');
 var aiModelLabel=$('aiModelLabel');
 
-function aiAddMessage(role,html){
+function aiAddMessage(role,content){
   var el=document.createElement('div');
   el.className='ai-msg '+role;
-  if(role==='assistant'||role==='user'){
-    el.innerHTML=role==='assistant'?renderMarkdown(html):esc(html).replace(/\n/g,'<br>');
-  } else {
-    el.textContent=html;
-  }
+  if(role==='assistant'){el.innerHTML=renderMarkdown(content);}
+  else if(role==='user'){el.innerHTML=esc(content).replace(/\n/g,'<br>');}
+  else{el.textContent=content;}
   aiMessages.appendChild(el);
   aiMessages.scrollTop=aiMessages.scrollHeight;
-  return el;
 }
-
 function aiAddTyping(){
   var el=document.createElement('div');
   el.className='ai-msg assistant';
@@ -1941,27 +1959,23 @@ function aiAddTyping(){
   el.innerHTML='<div class="ai-typing"><span></span><span></span><span></span></div>';
   aiMessages.appendChild(el);
   aiMessages.scrollTop=aiMessages.scrollHeight;
-  return el;
 }
-
 function aiRemoveTyping(){
   var el=$('aiTypingIndicator');
   if(el&&el.parentNode)el.parentNode.removeChild(el);
 }
-
 var SUGGESTIONS_GENERAL=[
   {icon:'fa-circle-question',text:'How do I fix "Cannot find module"?'},
   {icon:'fa-server',text:'App is not responding on its port'},
-  {icon:'fa-lock',text:'How do I add a database?'},
+  {icon:'fa-database',text:'How do I add a database?'}
 ];
 var SUGGESTIONS_PROJECT=[
   {icon:'fa-bug',text:'Why did my deploy fail?'},
   {icon:'fa-scroll',text:'Explain the logs'},
   {icon:'fa-link',text:'My /login route returns 404'},
   {icon:'fa-server',text:'App never opened its port'},
-  {icon:'fa-image',text:'Why are my static assets 404?'},
+  {icon:'fa-image',text:'Why are my static assets 404?'}
 ];
-
 function aiRenderSuggestions(){
   var list=aiProjectId?SUGGESTIONS_PROJECT:SUGGESTIONS_GENERAL;
   aiSuggestions.innerHTML=list.map(function(s){
@@ -1969,27 +1983,18 @@ function aiRenderSuggestions(){
       '<i class="fa-solid '+s.icon+'"></i>'+esc(s.text)+'</button>';
   }).join('');
 }
-
 function aiSetContext(projectId,projectName){
   aiProjectId=projectId;
   aiProjectName=projectName;
-  if(projectId){
-    aiContextLabel.textContent='Project: '+projectName;
-  } else {
-    aiContextLabel.textContent='General Node.js help';
-  }
+  if(projectId){aiContextLabel.textContent='Project: '+projectName;}
+  else{aiContextLabel.textContent='General Node.js help';}
   aiRenderSuggestions();
 }
-
 function openAI(projectId,projectName){
-  if(!aiEnabled){
-    toast('AI is not configured on this server',true);
-    return;
-  }
+  if(!aiEnabled){toast('AI is not configured on this server',true);return;}
   var changed=(projectId||null)!==(aiProjectId||null);
   if(changed){
     aiSetContext(projectId||null,projectName||null);
-    // Reset conversation when switching context
     aiMessages.innerHTML='';
     aiHistory=[];
     aiWelcome();
@@ -1998,19 +2003,16 @@ function openAI(projectId,projectName){
   aiPanel.setAttribute('aria-hidden','false');
   setTimeout(function(){aiInput.focus();},120);
 }
-
 function closeAI(){
   aiPanel.classList.remove('open');
   aiPanel.setAttribute('aria-hidden','true');
 }
-
 function resetAI(){
   aiSetContext(null,null);
   aiMessages.innerHTML='';
   aiHistory=[];
   aiWelcome();
 }
-
 function aiWelcome(){
   if(aiProjectId){
     aiAddMessage('system','Ask me anything about "'+aiProjectName+'". I can see its recent logs, file tree, and config.');
@@ -2018,7 +2020,6 @@ function aiWelcome(){
     aiAddMessage('system','Hi! I can help you debug Node.js deployment issues, explain errors, and suggest fixes. Ask me anything.');
   }
 }
-
 async function aiSendMessage(text){
   text=String(text||'').trim();
   if(!text||aiBusy)return;
@@ -2035,12 +2036,8 @@ async function aiSendMessage(text){
 
   try{
     var url=aiProjectId?'/api/projects/'+aiProjectId+'/ai':'/api/ai/chat';
-    // Send last few turns (excluding the one we just added) as history
     var hist=aiHistory.slice(0,-1).slice(-6);
-    var result=await api(url,{
-      method:'POST',
-      body:{message:text,history:hist}
-    });
+    var result=await api(url,{method:'POST',body:{message:text,history:hist}});
     aiRemoveTyping();
     var reply=result.reply||'(no response)';
     aiAddMessage('assistant',reply);
@@ -2054,19 +2051,16 @@ async function aiSendMessage(text){
     aiSend.disabled=false;
   }
 }
-
 aiSuggestions.addEventListener('click',function(e){
   var chip=e.target.closest('.ai-chip');
   if(!chip)return;
   var q=chip.getAttribute('data-q');
   if(q)aiSendMessage(q);
 });
-
 $('aiForm').onsubmit=function(e){
   e.preventDefault();
   aiSendMessage(aiInput.value);
 };
-
 aiInput.addEventListener('input',function(){
   aiInput.style.height='auto';
   aiInput.style.height=Math.min(aiInput.scrollHeight,180)+'px';
@@ -2077,7 +2071,6 @@ aiInput.addEventListener('keydown',function(e){
     $('aiForm').dispatchEvent(new Event('submit',{cancelable:true}));
   }
 });
-
 $('aiClose').onclick=closeAI;
 $('aiClear').onclick=function(){
   aiHistory=[];
@@ -2085,7 +2078,6 @@ $('aiClear').onclick=function(){
   aiWelcome();
   aiRenderSuggestions();
 };
-
 $('aiFab').onclick=function(){
   if(aiPanel.classList.contains('open'))closeAI();
   else openAI(null,null);
@@ -2129,7 +2121,8 @@ api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(fun
       api('/api/ai/status').then(function(s){
         aiEnabled=!!s.enabled;
         if(s.model)aiModelLabel.textContent=s.model.split('-').slice(0,2).join('-');
-      }).catch(function(){aiEnabled=false;}),
+        renderAuth();
+      }).catch(function(){aiEnabled=false;renderAuth();})
     ]);
   }
 }).then(function(){
@@ -2147,7 +2140,7 @@ api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(fun
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 
 /* ============================================================
- * Reverse proxy with HTML rewriting
+ * Reverse proxy
  * ============================================================ */
 
 const proxy = httpProxy.createProxyServer({
@@ -2253,29 +2246,20 @@ app.use(async (req, res, next) => {
 });
 
 function notRunningHtml(name, status) {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${name} — offline</title>
-<style>
-body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#09090b;color:#a1a1aa;
-  min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:40px;}
-.box{max-width:520px;text-align:center;border:1px solid #27272a;background:#111114;
-  padding:48px 40px;border-radius:12px;}
-h1{font-size:22px;color:#fafafa;margin:0 0 12px;font-weight:600;}
-p{margin:8px 0;line-height:1.6;}
-code{font-family:ui-monospace,Menlo,monospace;background:#18181b;padding:2px 6px;
-  border-radius:4px;color:#e4e4e7;}
-.badge{display:inline-block;padding:4px 10px;border-radius:100px;font-size:11px;
-  text-transform:uppercase;letter-spacing:.08em;font-weight:600;
-  background:rgba(245,158,11,.1);color:#f59e0b;border:1px solid rgba(245,158,11,.25);
-  margin-bottom:16px;}
-a{color:#60a5fa;text-decoration:none;}
-a:hover{text-decoration:underline;}
-</style></head>
-<body><div class="box">
-<span class="badge">${status}</span>
-<h1>This app is not running</h1>
-<p>Project <code>${name}</code> is currently <strong>${status}</strong>.</p>
-<p>Go to the <a href="/">dashboard</a> to start it.</p>
-</div></body></html>`;
+  return '<!doctype html><html><head><meta charset="utf-8"><title>' + name + ' — offline</title>' +
+    '<style>body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#a1a1aa;' +
+    'min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:40px;}' +
+    '.box{max-width:520px;text-align:center;border:1px solid #27272a;background:#111114;' +
+    'padding:48px 40px;border-radius:12px;}h1{font-size:22px;color:#fafafa;margin:0 0 12px;font-weight:600;}' +
+    'p{margin:8px 0;line-height:1.6;}code{font-family:ui-monospace,Menlo,monospace;background:#18181b;' +
+    'padding:2px 6px;border-radius:4px;color:#e4e4e7;}.badge{display:inline-block;padding:4px 10px;' +
+    'border-radius:100px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;' +
+    'background:rgba(245,158,11,.1);color:#f59e0b;border:1px solid rgba(245,158,11,.25);margin-bottom:16px;}' +
+    'a{color:#60a5fa;text-decoration:none;}a:hover{text-decoration:underline;}</style></head>' +
+    '<body><div class="box"><span class="badge">' + status + '</span>' +
+    '<h1>This app is not running</h1>' +
+    '<p>Project <code>' + name + '</code> is currently <strong>' + status + '</strong>.</p>' +
+    '<p>Go to the <a href="/">dashboard</a> to start it.</p></div></body></html>';
 }
 
 app.use((req, res) => {
@@ -2356,18 +2340,18 @@ async function connectMongo(retries) {
   retries = retries == null ? 5 : retries;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      console.log('  MongoDB    …  connecting (attempt ' + attempt + '/' + retries + ')');
+      console.log('  MongoDB    ... connecting (attempt ' + attempt + '/' + retries + ')');
       await mongoose.connect(MONGO_URI, {
         serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000,
         connectTimeoutMS: 30000, family: 4, maxPoolSize: 5,
       });
-      console.log('  MongoDB    ✓  connected');
+      console.log('  MongoDB    OK  connected');
       return;
     } catch (err) {
-      console.error('  MongoDB    ✗  attempt ' + attempt + ' failed:', err.message);
+      console.error('  MongoDB    ERR  attempt ' + attempt + ' failed:', err.message);
       if (attempt === retries) throw err;
       const wait = 3000 * attempt;
-      console.log('  retrying in ' + (wait / 1000) + 's…');
+      console.log('  retrying in ' + (wait / 1000) + 's...');
       await new Promise((r) => setTimeout(r, wait));
     }
   }
@@ -2376,25 +2360,25 @@ async function connectMongo(retries) {
 async function boot() {
   console.log('');
   console.log('  MiniDeploy — booting');
-  console.log('  ──────────────────────────────────────────');
-  console.log('  tar        ✓  v' + require('tar/package.json').version + ' (' + (tar.create ? 'create' : 'pack') + ')');
+  console.log('  ------------------------------------------');
+  console.log('  tar        OK  v' + require('tar/package.json').version + ' (' + (tar.create ? 'create' : 'pack') + ')');
 
-  if (AI_ENABLED) console.log('  AI         ✓  Groq (' + GROQ_MODEL + ')');
-  else console.log('  AI         ⚠  disabled (set GROQ_API_KEY)');
+  if (AI_ENABLED) console.log('  AI         OK  Groq (' + GROQ_MODEL + ')');
+  else console.log('  AI         --  disabled (set GROQ_API_KEY)');
 
-  if (INVITE_ONLY) console.log('  Invite     ✓  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
-  else console.log('  Invite     ⚠  OPEN SIGNUP (set ALLOWED_EMAILS to restrict)');
+  if (INVITE_ONLY) console.log('  Invite     OK  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
+  else console.log('  Invite     --  OPEN SIGNUP (set ALLOWED_EMAILS to restrict)');
 
   if (process.platform !== 'win32' && process.getuid && process.getuid() === 0) {
-    console.warn('  Runtime    ⚠  running as root');
+    console.warn('  Runtime    !!  running as root');
   }
 
   try {
     const host = MONGO_URI.replace(/^mongodb(\+srv)?:\/\//, '').split('@').pop().split('/')[0].split('?')[0];
-    console.log('  resolving  ' + host + ' …');
+    console.log('  resolving  ' + host + ' ...');
     const addrs = await dns.promises.resolveSrv('_mongodb._tcp.' + host).catch(() => null);
-    if (addrs && addrs.length) console.log('  SRV        ✓  ' + addrs.length + ' target(s) resolved');
-    else console.log('  SRV        ·  no SRV records');
+    if (addrs && addrs.length) console.log('  SRV        OK  ' + addrs.length + ' target(s) resolved');
+    else console.log('  SRV        --  no SRV records');
   } catch (e) { console.log('  DNS probe skipped:', e.message); }
 
   await connectMongo(5);
@@ -2404,23 +2388,23 @@ async function boot() {
   } catch (e) {
     if (e.$metadata?.httpStatusCode === 404) {}
     else if (e.name === 'NotFound' || e.Code === 'NotFound') {}
-    else console.warn('  B2         ⚠  ' + e.message);
+    else console.warn('  B2         !!  ' + e.message);
   }
-  console.log('  B2 bucket  ✓  ' + B2_BUCKET_NAME);
-  console.log('  npm cache  ✓  ' + NPM_CACHE_DIR);
+  console.log('  B2 bucket  OK  ' + B2_BUCKET_NAME);
+  console.log('  npm cache  OK  ' + NPM_CACHE_DIR);
 
   try {
     const names = await Project.find({}, 'name').lean();
     for (const p of names) projectNames.add(p.name);
-    console.log('  Projects   ✓  ' + projectNames.size + ' name(s) cached');
+    console.log('  Projects   OK  ' + projectNames.size + ' name(s) cached');
   } catch (e) {
-    console.warn('  Projects   ⚠  could not load names:', e.message);
+    console.warn('  Projects   !!  could not load names:', e.message);
   }
 
   server.listen(PORT, () => {
     console.log('');
     console.log('  MiniDeploy running');
-    console.log('  ──────────────────────────────────────────');
+    console.log('  ------------------------------------------');
     console.log('  Dashboard :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/');
     console.log('  Health    :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/health');
     console.log('  Apps      :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/');
@@ -2441,7 +2425,7 @@ let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('\n' + signal + ': shutting down gracefully…');
+  console.log('\n' + signal + ': shutting down gracefully...');
   for (const [id] of running) { try { stopProject(id, { silent: true }); } catch (e) {} }
   for (const [pid, buf] of logBuffers) {
     LogEntry.findOneAndUpdate({ project_id: pid }, { content: buf }, { upsert: true }).catch(() => {});
