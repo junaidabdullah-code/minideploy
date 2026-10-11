@@ -56,9 +56,11 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 const B2_REGION = process.env.B2_REGION || 'us-east-005';
 const B2_FOLDER = process.env.B2_FOLDER || 'bdeploy';
 
-// ── AI (Groq) — read from env only, no hardcoded fallback ──
+// ── AI (Groq) — env only, no hardcoded key ──
+// NOTE: `llama-3.3-70b-versatile` was retired by Groq on 2026-08-16.
+// `openai/gpt-oss-120b` is the recommended drop-in replacement.
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const AI_ENABLED = !!GROQ_API_KEY;
 
@@ -72,7 +74,7 @@ const INSTALL_MAX_MS = Number(process.env.INSTALL_MAX_MS || 6 * 60 * 1000);
 const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS || 45 * 1000);
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
-  console.error('FATAL: SESSION_SECRET must be ≥32 chars.');
+  console.error('FATAL: SESSION_SECRET must be >=32 chars.');
   process.exit(1);
 }
 if (!MONGO_URI) { console.error('FATAL: MONGO_URI required.'); process.exit(1); }
@@ -368,7 +370,12 @@ async function callGroq(messages, opts) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error('Groq API ' + res.status + ': ' + text.slice(0, 300));
+      // Give the user a clear hint when a model is retired
+      let hint = '';
+      if (res.status === 404 && /model/i.test(text)) {
+        hint = ' (model "' + body.model + '" is not available on Groq — set GROQ_MODEL to a current model like openai/gpt-oss-120b)';
+      }
+      throw new Error('Groq API ' + res.status + ': ' + text.slice(0, 300) + hint);
     }
 
     const data = await res.json();
@@ -731,7 +738,7 @@ async function startProject(projectId) {
   const suffix = PORT === 80 ? '' : ':' + PORT;
   waitForPort(port, STARTUP_TIMEOUT_MS).then(async () => {
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
-    appendLog(projectId, '\n[bdeploy] ✓ live at http://' + BASE_DOMAIN + suffix + '/' + project.name + '/\n');
+    appendLog(projectId, '\n[bdeploy] live at http://' + BASE_DOMAIN + suffix + '/' + project.name + '/\n');
   }).catch(async () => {
     appendLog(projectId, '[bdeploy] warning: port ' + port + ' not ready within ' + Math.round(STARTUP_TIMEOUT_MS / 1000) + 's\n');
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
@@ -902,7 +909,7 @@ app.get('/health', (req, res) => {
     running: running.size,
     projects: projectNames.size,
     ai: AI_ENABLED ? 'enabled' : 'disabled',
-    version: '1.3.1',
+    version: '1.3.2',
   });
 });
 
@@ -1733,7 +1740,7 @@ function api(url,opts){
 
 /* Tiny markdown renderer — avoids literal backticks in source */
 function renderMarkdown(text){
-  var BQ=String.fromCharCode(96);            // backtick char
+  var BQ=String.fromCharCode(96);
   var FENCE=BQ+BQ+BQ;
   var s=String(text==null?'':text).replace(/[&<>]/g,function(c){
     return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';
@@ -1883,7 +1890,7 @@ function classLine(l){
   if(t.charAt(0)==='$')return'log-cmd';
   if(t.indexOf('[bdeploy]')===0)return'log-sys';
   if(/^error|^ERR!|failed|exception|throw /i.test(t))return'log-err';
-  if(/listening|ready on|live at|started on|server running|live at/i.test(t))return'log-ok';
+  if(/listening|ready on|live at|started on|server running/i.test(t))return'log-ok';
   if(/^warn|deprecated/i.test(t))return'log-info';
   return'log-out';
 }
