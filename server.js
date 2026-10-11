@@ -17,7 +17,18 @@ const net = require('net');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { pipeline } = require('stream/promises');
-const { pack: tarPack, extract: tarExtract } = require('tar');
+
+// ── tar compatibility: v7 uses `create`, v6 has both `create` and `pack` ──
+const tar = require('tar');
+const tarCreate = tar.create || tar.pack;
+const tarExtract = tar.extract;
+
+if (typeof tarCreate !== 'function' || typeof tarExtract !== 'function') {
+  console.error('FATAL: `tar` package has no usable create/extract exports.');
+  console.error('  installed version:', require('tar/package.json').version);
+  console.error('  fix: npm install tar@^6.2.0');
+  process.exit(1);
+}
 
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -69,8 +80,6 @@ fs.mkdirSync(TEMP_ROOT, { recursive: true });
 const NPM_CACHE_DIR = path.join(TEMP_ROOT, 'npm-cache');
 fs.mkdirSync(NPM_CACHE_DIR, { recursive: true });
 
-// Reserved names — cannot be used as project names.
-// Includes every dashboard route so path-based routing never collides.
 const RESERVED = new Set([
   'www','api','admin','app','mail','ftp','cdn','static','assets','blog','docs',
   'status','support','dashboard','test','dev','staging','root','localhost',
@@ -125,7 +134,6 @@ function buildChildEnv(projectId, userEnv, port, projectName) {
   env.NODE_ENV = 'production';
   if (port != null) { env.PORT = String(port); env.HOST = '0.0.0.0'; }
   if (projectName) {
-    // Pass the sub-path to the app so it can generate correct URLs
     env.BASE_PATH = '/' + projectName;
     env.PUBLIC_PATH = '/' + projectName;
     env.PUBLIC_URL = '/' + projectName;
@@ -157,7 +165,11 @@ const b2Key = (projectId) => B2_FOLDER + '/' + projectId + '.tar.gz';
 async function uploadToB2(projectId, sourceDir) {
   const tarPath = path.join(TEMP_ROOT, projectId + '.tar.gz');
   try {
-    await tarPack({ gzip: { level: 1 }, file: tarPath, cwd: sourceDir }, ['.']);
+    // FIX: use tarCreate (v7) or tar.pack (v6)
+    await tarCreate(
+      { gzip: { level: 1 }, file: tarPath, cwd: sourceDir },
+      ['.']
+    );
     const stat = fs.statSync(tarPath);
     const upload = new Upload({
       client: s3,
@@ -246,7 +258,6 @@ const safeJson = (val, fallback = {}) => {
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 const sourceDir = (projectId) => path.join(TEMP_ROOT, 'src-' + projectId);
 
-// In-memory cache of project names for fast path-routing
 const projectNames = new Set();
 
 function allocatePort() {
@@ -743,8 +754,6 @@ const authLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const signupLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 });
 const createProjectLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20 });
 
-/* ---------- Health ---------- */
-
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
@@ -752,11 +761,9 @@ app.get('/health', (req, res) => {
     uptime: Math.floor(process.uptime()),
     running: running.size,
     projects: projectNames.size,
-    version: '1.2.0',
+    version: '1.2.1',
   });
 });
-
-/* ---------- Auth routes ---------- */
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
@@ -795,8 +802,6 @@ app.get('/api/auth/me', async (req, res) => {
   res.json({ user: { id: String(user._id), email: user.email } });
 });
 
-/* ---------- Projects API ---------- */
-
 app.get('/api/projects', requireAuth, async (req, res) => {
   const list = await Project.find({ user_id: req.user.id }).sort({ createdAt: -1 }).lean();
   const out = list.map((p) => {
@@ -832,7 +837,7 @@ app.post('/api/projects', requireAuth, createProjectLimiter, async (req, res) =>
       env_vars: JSON.stringify(envObj), status: 'created',
     });
     const pid = String(project._id);
-    projectNames.add(name);                     // cache for path routing
+    projectNames.add(name);
     fs.mkdirSync(sourceDir(pid), { recursive: true });
     res.status(201).json({ project: serializeProject(project) });
     deployProject(pid).catch((err) => console.error('[deploy]', err));
@@ -907,7 +912,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
   const p = await ownProject(req, res); if (!p) return;
   const pid = String(p._id);
   stopProject(pid);
-  projectNames.delete(p.name);                // remove from cache
+  projectNames.delete(p.name);
   try { fs.rmSync(sourceDir(pid), { recursive: true, force: true }); } catch (e) {}
   await Project.findByIdAndDelete(p._id);
   await LogEntry.deleteOne({ project_id: pid });
@@ -920,7 +925,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 /* ============================================================
- * Dashboard HTML — premium zinc UI
+ * Dashboard HTML — same UI as before
  * ============================================================ */
 
 const DASHBOARD_HTML = String.raw`<!doctype html>
@@ -935,9 +940,6 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{
-  --z50:#fafafa;--z100:#f4f4f5;--z200:#e4e4e7;--z300:#d4d4d8;
-  --z400:#a1a1aa;--z500:#71717a;--z600:#52525b;--z700:#3f3f46;
-  --z800:#27272a;--z900:#18181b;--z950:#09090b;
   --bg:#0a0a0c;--surface:#111114;--raised:#17171b;--overlay:#1c1c21;
   --bd:rgba(255,255,255,.055);--bd-soft:rgba(255,255,255,.035);--bd-strong:rgba(255,255,255,.09);
   --tx:#fafafa;--tx-soft:#d4d4d8;--tx-mut:#8a8a93;--tx-dim:#5c5c66;
@@ -971,8 +973,8 @@ input,textarea{font:inherit;}
 ::selection{background:rgba(255,255,255,.15);color:var(--tx);}
 ::-webkit-scrollbar{width:8px;height:8px;}
 ::-webkit-scrollbar-track{background:transparent;}
-::-webkit-scrollbar-thumb{background:var(--z800);border-radius:4px;border:2px solid var(--bg);}
-::-webkit-scrollbar-thumb:hover{background:var(--z700);}
+::-webkit-scrollbar-thumb{background:#27272a;border-radius:4px;border:2px solid var(--bg);}
+::-webkit-scrollbar-thumb:hover{background:#3f3f46;}
 .topbar{position:sticky;top:0;z-index:50;height:64px;
   background:rgba(10,10,12,.72);backdrop-filter:saturate(180%) blur(20px);
   -webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid var(--bd);}
@@ -1054,7 +1056,7 @@ input,textarea{font:inherit;}
 .input{width:100%;height:42px;padding:0 14px;background:var(--bg);color:var(--tx);
   border:1px solid var(--bd);border-radius:var(--r-sm);font-family:var(--body);
   font-size:13.5px;outline:none;transition:all .15s;box-shadow:inset 0 1px 2px rgba(0,0,0,.25);}
-.input:focus{border-color:var(--z600);
+.input:focus{border-color:#52525b;
   box-shadow:inset 0 1px 2px rgba(0,0,0,.25),0 0 0 3px rgba(255,255,255,.05);}
 .input::placeholder{color:var(--tx-dim);}
 textarea.input{height:auto;min-height:104px;padding:11px 14px;
@@ -1201,7 +1203,7 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 .term-live.paused .term-live-dot{box-shadow:none;animation:none;}
 .term-follow{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
   user-select:none;color:var(--tx-mut);font-family:var(--mono);font-size:11px;}
-.term-follow input{width:auto;accent-color:var(--z500);cursor:pointer;transform:scale(.9);}
+.term-follow input{width:auto;accent-color:#71717a;cursor:pointer;transform:scale(.9);}
 .term-close{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;
   background:var(--surface);border:1px solid var(--bd);border-radius:6px;
   color:var(--tx-mut);font-family:var(--mono);font-size:10.5px;
@@ -1215,12 +1217,8 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 .log-line.partial::after{content:'▋';margin-left:2px;color:var(--tx-dim);
   animation:blink 1s steps(2,start) infinite;}
 @keyframes blink{to{opacity:0}}
-.log-cmd{color:#86efac;}
-.log-err{color:#fca5a5;}
-.log-sys{color:var(--tx-mut);}
-.log-ok{color:#93c5fd;}
-.log-info{color:#fde68a;}
-.log-out{color:var(--tx-soft);}
+.log-cmd{color:#86efac;}.log-err{color:#fca5a5;}.log-sys{color:var(--tx-mut);}
+.log-ok{color:#93c5fd;}.log-info{color:#fde68a;}.log-out{color:var(--tx-soft);}
 @media(max-width:640px){
   .topbar-in,.container{padding:0 20px;}
   .page-head{flex-direction:column;align-items:stretch;gap:16px;}
@@ -1567,42 +1565,23 @@ app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 const proxy = httpProxy.createProxyServer({
   xfwd: true,
   ws: true,
-  selfHandleResponse: true,  // we handle the response to rewrite HTML
+  selfHandleResponse: true,
   changeOrigin: true,
 });
 
-// Force upstream to send uncompressed so we can rewrite safely
 proxy.on('proxyReq', (proxyReq) => {
   proxyReq.setHeader('Accept-Encoding', 'identity');
 });
 
-/**
- * Rewrite absolute-path URLs in HTML so client-side navigation works
- * under a sub-path deployment.
- *
- *   <a href="/login">          →  <a href="/myapp/login">
- *   <script src="/app.js">     →  <script src="/myapp/app.js">
- *   <form action="/submit">    →  <form action="/myapp/submit">
- *   url("/img.png")            →  url("/myapp/img.png")
- *
- * Also injects <base href="/myapp/"> so relative URLs resolve correctly.
- * Protocol-relative URLs (//cdn.com/...) are left alone.
- */
 function rewriteHtml(html, projectName) {
   const prefix = '/' + projectName;
   const baseHref = prefix + '/';
 
-  // 1. Inject <base> if the app didn't already set one
   if (/<head[\s>]/i.test(html) && !/<base[\s>]/i.test(html)) {
     html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<base href="' + baseHref + '">');
   }
-
-  // 2. Rewrite absolute-path attributes. \b prevents matching inside
-  //    longer words, (?!\/) prevents matching protocol-relative //...
   const attrRe = /\b(href|src|action|poster)\s*=\s*(["'])\/(?!\/)/gi;
   html = html.replace(attrRe, (_m, attr, q) => attr + '=' + q + prefix + '/');
-
-  // 3. Rewrite url(/...) in inline styles and <style> blocks
   html = html.replace(/url\(\s*(["']?)\/(?!\/)/gi, (_m, q) => 'url(' + q + prefix + '/');
 
   return html;
@@ -1611,7 +1590,6 @@ function rewriteHtml(html, projectName) {
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const projectName = req._projectName;
 
-  // Rewrite Location headers on redirects — /home → /myapp/home
   if (projectName && proxyRes.headers.location) {
     const loc = proxyRes.headers.location;
     if (typeof loc === 'string' && loc.startsWith('/') && !loc.startsWith('//')) {
@@ -1623,22 +1601,17 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const isHtml = /text\/html/i.test(ct);
 
   if (!projectName || !isHtml) {
-    // Pass through as-is
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
     return;
   }
 
-  // Buffer HTML, rewrite, send
   const chunks = [];
   proxyRes.on('data', (c) => chunks.push(c));
   proxyRes.on('end', () => {
     let body = Buffer.concat(chunks).toString('utf8');
-    try {
-      body = rewriteHtml(body, projectName);
-    } catch (e) {
-      console.error('[rewrite]', e.message);
-    }
+    try { body = rewriteHtml(body, projectName); }
+    catch (e) { console.error('[rewrite]', e.message); }
     const headers = { ...proxyRes.headers };
     delete headers['content-length'];
     headers['content-length'] = String(Buffer.byteLength(body, 'utf8'));
@@ -1660,52 +1633,37 @@ proxy.on('error', (err, req, res) => {
   if (typeof res.end === 'function') res.end('502 Bad Gateway — app not responding');
 });
 
-/* ---------- Legacy /preview/:name (kept for backward compat) ---------- */
-
 app.use('/preview/:name', async (req, res, next) => {
   const name = String(req.params.name || '').toLowerCase();
   const project = await Project.findOne({ name });
   if (!project) return next();
   const rt = running.get(String(project._id));
-  if (!rt) {
-    return res.status(503).type('html').send(notRunningHtml(name, project.status));
-  }
+  if (!rt) return res.status(503).type('html').send(notRunningHtml(name, project.status));
   req.url = req.originalUrl.replace(/^\/preview\/[^/]+/, '') || '/';
   req._projectName = name;
   proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
 });
 
-/* ---------- NEW: /<project-name>/... primary path-based routing ----- */
-
 app.use(async (req, res, next) => {
-  // Skip if no path segments
   const parts = req.path.split('/').filter(Boolean);
   if (!parts.length) return next();
 
   const name = parts[0].toLowerCase();
-
-  // Fast reject: not a project name → fall through to 404
   if (!projectNames.has(name)) return next();
 
-  // Look up the project
   const project = await Project.findOne({ name });
   if (!project) {
-    projectNames.delete(name);  // stale cache
+    projectNames.delete(name);
     return next();
   }
 
   const rt = running.get(String(project._id));
-  if (!rt) {
-    return res.status(503).type('html').send(notRunningHtml(name, project.status));
-  }
+  if (!rt) return res.status(503).type('html').send(notRunningHtml(name, project.status));
 
-  // Strip /<name> prefix so the app sees /login, /api/..., etc.
   req.url = req.originalUrl.replace(/^\/[^/]+/, '') || '/';
   req._projectName = name;
   proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
 });
-
-/* ---------- Not-running page ---------- */
 
 function notRunningHtml(name, status) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${name} — offline</title>
@@ -1733,8 +1691,6 @@ a:hover{text-decoration:underline;}
 </div></body></html>`;
 }
 
-/* ---------- 404 for everything else ---------- */
-
 app.use((req, res) => {
   res.status(404).type('html').send(
     '<!doctype html><meta charset="utf-8"><title>404</title>' +
@@ -1749,10 +1705,6 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Internal server error' });
 });
-
-/* ============================================================
- * Subdomain handler (optional, custom domain only)
- * ============================================================ */
 
 function getSubdomain(hostHeader) {
   if (!hostHeader) return null;
@@ -1772,13 +1724,12 @@ const server = http.createServer(async (req, res) => {
     const sub = getSubdomain(req.headers.host);
     if (!sub) return app(req, res);
 
-    // Subdomain deployment: app runs at root, no rewriting needed
     const project = await Project.findOne({ name: sub });
     if (!project) return sendPlain(res, 404, '404 - no app "' + sub + '"');
     const rt = running.get(String(project._id));
     if (!rt) return sendPlain(res, 503, '503 - "' + sub + '" not running (' + project.status + ')');
 
-    req._projectName = null;   // signals proxyRes: skip rewriting
+    req._projectName = null;
     proxy.web(req, res, { target: 'http://127.0.0.1:' + rt.port });
   } catch (err) {
     console.error('[server]', err);
@@ -1788,7 +1739,6 @@ const server = http.createServer(async (req, res) => {
 
 server.on('upgrade', async (req, socket, head) => {
   try {
-    // WebSocket for subdomain
     const sub = getSubdomain(req.headers.host);
     if (sub) {
       const project = await Project.findOne({ name: sub });
@@ -1797,7 +1747,6 @@ server.on('upgrade', async (req, socket, head) => {
       return proxy.ws(req, socket, head, { target: 'ws://127.0.0.1:' + rt.port });
     }
 
-    // WebSocket for path-based (/myapp/ws)
     const parts = req.url.split('?')[0].split('/').filter(Boolean);
     if (!parts.length) return socket.destroy();
     const name = parts[0].toLowerCase();
@@ -1807,7 +1756,6 @@ server.on('upgrade', async (req, socket, head) => {
     const rt = project && running.get(String(project._id));
     if (!rt) return socket.destroy();
 
-    // Strip /<name> prefix
     req.url = '/' + parts.slice(1).join('/');
     proxy.ws(req, socket, head, { target: 'ws://127.0.0.1:' + rt.port });
   } catch (e) { socket.destroy(); }
@@ -1842,6 +1790,7 @@ async function boot() {
   console.log('');
   console.log('  MiniDeploy — booting');
   console.log('  ──────────────────────────────────────────');
+  console.log('  tar        ✓  v' + require('tar/package.json').version + ' (' + (tar.create ? 'create' : 'pack') + ')');
 
   if (INVITE_ONLY) console.log('  Invite     ✓  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
   else { console.log('  Invite     ⚠  OPEN SIGNUP'); console.log('             Set ALLOWED_EMAILS to restrict'); }
@@ -1870,7 +1819,6 @@ async function boot() {
   console.log('  B2 bucket  ✓  ' + B2_BUCKET_NAME);
   console.log('  npm cache  ✓  ' + NPM_CACHE_DIR);
 
-  // Preload project names for path routing
   try {
     const names = await Project.find({}, 'name').lean();
     for (const p of names) projectNames.add(p.name);
