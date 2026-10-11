@@ -18,7 +18,6 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { pipeline } = require('stream/promises');
 
-// ── tar compatibility: v7 uses `create`, v6 has both `create` and `pack` ──
 const tar = require('tar');
 const tarCreate = tar.create || tar.pack;
 const tarExtract = tar.extract;
@@ -57,6 +56,12 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 const B2_REGION = process.env.B2_REGION || 'us-east-005';
 const B2_FOLDER = process.env.B2_FOLDER || 'bdeploy';
 
+// ── AI (Groq) ──
+const GROQ_API_KEY = process.env.GROQ_API_KEY ;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const AI_ENABLED = !!GROQ_API_KEY;
+
 const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const INVITE_ONLY = ALLOWED_EMAILS.length > 0;
 const MAX_PROJECTS_PER_USER = Number(process.env.MAX_PROJECTS_PER_USER || 5);
@@ -85,7 +90,7 @@ const RESERVED = new Set([
   'status','support','dashboard','test','dev','staging','root','localhost',
   'ns','ns1','ns2','smtp','imap','pop','vpn','preview',
   'health','favicon.ico','robots.txt','sitemap.xml','manifest.json',
-  'login','logout','signup','register','auth',
+  'login','logout','signup','register','auth','ai',
 ]);
 
 /* ============================================================
@@ -150,7 +155,7 @@ function buildChildEnv(projectId, userEnv, port, projectName) {
 }
 
 /* ============================================================
- * B2 — streamed I/O
+ * B2
  * ============================================================ */
 
 const s3 = new S3Client({
@@ -165,11 +170,7 @@ const b2Key = (projectId) => B2_FOLDER + '/' + projectId + '.tar.gz';
 async function uploadToB2(projectId, sourceDir) {
   const tarPath = path.join(TEMP_ROOT, projectId + '.tar.gz');
   try {
-    // FIX: use tarCreate (v7) or tar.pack (v6)
-    await tarCreate(
-      { gzip: { level: 1 }, file: tarPath, cwd: sourceDir },
-      ['.']
-    );
+    await tarCreate({ gzip: { level: 1 }, file: tarPath, cwd: sourceDir }, ['.']);
     const stat = fs.statSync(tarPath);
     const upload = new Upload({
       client: s3,
@@ -185,9 +186,7 @@ async function uploadToB2(projectId, sourceDir) {
     });
     await upload.done();
     console.log('[b2] uploaded', b2Key(projectId), '(' + (stat.size / 1024).toFixed(1) + ' KB)');
-  } finally {
-    try { fs.unlinkSync(tarPath); } catch (e) {}
-  }
+  } finally { try { fs.unlinkSync(tarPath); } catch (e) {} }
 }
 
 async function downloadFromB2(projectId, destDir) {
@@ -202,9 +201,7 @@ async function downloadFromB2(projectId, destDir) {
   } catch (err) {
     if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) return false;
     throw err;
-  } finally {
-    try { fs.unlinkSync(tarPath); } catch (e) {}
-  }
+  } finally { try { fs.unlinkSync(tarPath); } catch (e) {} }
 }
 
 async function deleteFromB2(projectId) {
@@ -294,6 +291,178 @@ function serializeProject(p) {
   obj.id = obj._id ? String(obj._id) : obj.id;
   const { env_vars, _id, __v, ...rest } = obj;
   return { ...rest, env: envToText(safeJson(env_vars)) };
+}
+
+/* ============================================================
+ * AI source inspection (safe, bounded)
+ * ============================================================ */
+
+const IGNORED_DIRS = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.cache', '.npm', 'tmp']);
+
+function listSourceFiles(srcDir, maxFiles = 60) {
+  const out = [];
+  const walk = (dir, prefix, depth) => {
+    if (out.length >= maxFiles || depth > 4) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (out.length >= maxFiles) break;
+        if (e.name.startsWith('.') && e.name !== '.env.example') continue;
+        if (IGNORED_DIRS.has(e.name)) continue;
+        const rel = prefix ? prefix + '/' + e.name : e.name;
+        if (e.isDirectory()) walk(path.join(dir, e.name), rel, depth + 1);
+        else out.push(rel);
+      }
+    } catch (err) { /* ignore */ }
+  };
+  walk(srcDir, '', 0);
+  return out;
+}
+
+function readSourceFile(srcDir, relPath, maxBytes = 8000) {
+  if (!relPath || typeof relPath !== 'string') return null;
+  const norm = path.normalize(relPath).replace(/^(\.\.[/\\])+/, '');
+  const full = path.resolve(srcDir, norm);
+  const root = path.resolve(srcDir);
+  if (!full.startsWith(root + path.sep) && full !== root) return null;
+  try {
+    const stat = fs.statSync(full);
+    if (!stat.isFile()) return null;
+    if (stat.size > maxBytes * 4) {
+      return fs.readFileSync(full, 'utf8').slice(0, maxBytes) + '\n\n... (truncated, file is ' + stat.size + ' bytes)';
+    }
+    return fs.readFileSync(full, 'utf8');
+  } catch (err) { return null; }
+}
+
+/* ============================================================
+ * Groq client
+ * ============================================================ */
+
+async function callGroq(messages, opts) {
+  opts = opts || {};
+  if (!AI_ENABLED) throw new Error('AI not configured (set GROQ_API_KEY)');
+
+  const body = {
+    model: opts.model || GROQ_MODEL,
+    messages,
+    temperature: opts.temperature != null ? opts.temperature : 0.3,
+    max_tokens: opts.maxTokens || 1200,
+    top_p: opts.topP != null ? opts.topP : 0.95,
+    stream: false,
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error('Groq API ' + res.status + ': ' + text.slice(0, 300));
+    }
+
+    const data = await res.json();
+    const choice = data && data.choices && data.choices[0];
+    if (!choice) throw new Error('Groq returned no choices');
+    return {
+      reply: choice.message.content || '',
+      usage: data.usage || null,
+      model: data.model || body.model,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+const AI_SYSTEM_PROMPT = [
+  'You are MiniDeploy AI, an expert DevOps and Node.js debugging assistant built into the MiniDeploy PaaS.',
+  '',
+  'Environment facts:',
+  '- Apps run as child processes on Linux (Render), Node 18+, npm.',
+  '- Each app receives PORT, HOST=0.0.0.0, NODE_ENV=production, BASE_PATH=/<project-name>.',
+  '- Apps are served at https://<host>/<project-name>/ via a path-prefix reverse proxy.',
+  '- The proxy injects a <base href="/<name>/"> tag and rewrites absolute URLs in HTML responses.',
+  '- Git clones are shallow. Installs use `npm ci --omit=dev` when a lockfile exists, else `npm install --omit=dev`.',
+  '- Build timeout: git 2m, npm install 6m max / 90s idle. App has 45s to bind its port.',
+  '',
+  'Common failures and how to explain them:',
+  '- "Cannot find module X" → dependency missing or not in dependencies (only devDependencies).',
+  '- App never binds port → forgot to read process.env.PORT, or bound to 127.0.0.1.',
+  '- EADDRINUSE → app hardcoded a port.',
+  '- Client-side routes 404 → router needs basename=PUBLIC_PATH or use relative links.',
+  '- Assets 404 → uses absolute /path instead of ./path or BASE_PATH.',
+  '',
+  'Style:',
+  '- Be concise. No filler, no apologies, no "great question".',
+  '- Lead with the root cause, then the fix.',
+  '- Use markdown. Wrap code in ``` with language.',
+  '- If the fix is a code change, show the exact snippet.',
+  '- If you cannot determine the cause from the context, say so and ask ONE targeted question.',
+  '- Never invent log lines or file contents you were not given.',
+].join('\n');
+
+function buildProjectContext(project, opts) {
+  opts = opts || {};
+  const pid = String(project._id);
+  const src = sourceDir(pid);
+
+  const parts = [];
+  parts.push('=== PROJECT CONTEXT ===');
+  parts.push('Name: ' + project.name);
+  parts.push('URL path: /' + project.name + '/');
+  parts.push('Status: ' + project.status);
+  parts.push('Repo: ' + (project.repo_url || '(none — placeholder app)'));
+  parts.push('Install command: ' + project.install_command);
+  parts.push('Start command: ' + project.start_command);
+  parts.push('Running on port: ' + (project.port || '(not yet assigned)'));
+
+  const envObj = safeJson(project.env_vars);
+  const envKeys = Object.keys(envObj);
+  if (envKeys.length) {
+    parts.push('User env vars (names only): ' + envKeys.join(', '));
+  }
+
+  if (fs.existsSync(src)) {
+    const files = listSourceFiles(src);
+    if (files.length) {
+      parts.push('');
+      parts.push('File tree (excluding node_modules/.git):');
+      parts.push(files.join('\n'));
+    }
+  }
+
+  if (opts.includeFile) {
+    const content = readSourceFile(src, opts.includeFile);
+    if (content) {
+      parts.push('');
+      parts.push('Contents of ' + opts.includeFile + ':');
+      parts.push('```');
+      parts.push(content);
+      parts.push('```');
+    }
+  }
+
+  const logs = readLogs(pid);
+  if (logs) {
+    const tail = logs.slice(-9000);
+    parts.push('');
+    parts.push('=== RECENT LOGS (last ~9KB) ===');
+    parts.push('```');
+    parts.push(tail);
+    parts.push('```');
+  }
+
+  return parts.join('\n');
 }
 
 /* ============================================================
@@ -512,10 +681,6 @@ function writePlaceholderApp(dir, name) {
   fs.writeFileSync(path.join(dir, 'package.json'), pkg, 'utf8');
 }
 
-/* ============================================================
- * Start project
- * ============================================================ */
-
 async function startProject(projectId) {
   stopProject(projectId, { silent: true });
   const project = await Project.findById(projectId);
@@ -534,11 +699,8 @@ async function startProject(projectId) {
       const fastInstall = buildFastInstall(project.install_command, src);
       if (fastInstall) {
         appendLog(projectId, '$ ' + fastInstall + '\n');
-        try {
-          await runCommand(fastInstall, src, projectId, { idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS });
-        } catch (err) {
-          appendLog(projectId, '[bdeploy] install warning: ' + err.message + '\n');
-        }
+        try { await runCommand(fastInstall, src, projectId, { idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS }); }
+        catch (err) { appendLog(projectId, '[bdeploy] install warning: ' + err.message + '\n'); }
       }
     }
   }
@@ -574,7 +736,6 @@ async function startProject(projectId) {
   waitForPort(port, STARTUP_TIMEOUT_MS).then(async () => {
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
     appendLog(projectId, '\n[bdeploy] ✓ live at http://' + BASE_DOMAIN + suffix + '/' + project.name + '/\n');
-    appendLog(projectId, '[bdeploy] ✓ app routes work: /' + project.name + '/login, /' + project.name + '/api/...\n');
   }).catch(async () => {
     appendLog(projectId, '[bdeploy] warning: port ' + port + ' not ready within ' + Math.round(STARTUP_TIMEOUT_MS / 1000) + 's\n');
     await Project.findByIdAndUpdate(projectId, { status: 'running' });
@@ -590,10 +751,6 @@ function stopProject(projectId, opts) {
     running.delete(projectId);
   }
 }
-
-/* ============================================================
- * Deploy pipeline — FAST
- * ============================================================ */
 
 async function deployProject(projectId) {
   const project = await Project.findById(projectId);
@@ -616,15 +773,9 @@ async function deployProject(projectId) {
       if (hasGit) {
         appendLog(projectId, '[bdeploy] step 1/2 — pulling latest\n');
         appendLog(projectId, '$ git fetch --depth 1 --no-tags origin\n');
-        await runCommand('git', src, projectId, {
-          args: ['fetch', '--depth', '1', '--no-tags', 'origin'],
-          maxMs: GIT_TIMEOUT_MS,
-        });
+        await runCommand('git', src, projectId, { args: ['fetch', '--depth', '1', '--no-tags', 'origin'], maxMs: GIT_TIMEOUT_MS });
         appendLog(projectId, '$ git reset --hard FETCH_HEAD\n');
-        await runCommand('git', src, projectId, {
-          args: ['reset', '--hard', 'FETCH_HEAD'],
-          maxMs: GIT_TIMEOUT_MS,
-        });
+        await runCommand('git', src, projectId, { args: ['reset', '--hard', 'FETCH_HEAD'], maxMs: GIT_TIMEOUT_MS });
       } else {
         fs.rmSync(src, { recursive: true, force: true });
         appendLog(projectId, '[bdeploy] step 1/2 — cloning (shallow)\n');
@@ -646,9 +797,7 @@ async function deployProject(projectId) {
     if (fastInstall) {
       appendLog(projectId, '[bdeploy] step 2/2 — installing dependencies\n');
       appendLog(projectId, '$ ' + fastInstall + '\n');
-      await runCommand(fastInstall, src, projectId, {
-        idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS,
-      });
+      await runCommand(fastInstall, src, projectId, { idleMs: INSTALL_IDLE_MS, maxMs: INSTALL_MAX_MS });
     } else {
       appendLog(projectId, '[bdeploy] step 2/2 — no dependencies to install\n');
     }
@@ -679,10 +828,6 @@ async function archiveToB2Background(projectId, src) {
   }
 }
 
-/* ============================================================
- * Autostart
- * ============================================================ */
-
 async function autoStartProjects() {
   try {
     const all = await Project.find({
@@ -696,9 +841,7 @@ async function autoStartProjects() {
       await loadLogs(pid);
       setTimeout(() => startProject(pid).catch((err) => console.error('[boot] start', p.name, err.message)), 800);
     }
-  } catch (err) {
-    console.error('[boot] autostart failed:', err.message);
-  }
+  } catch (err) { console.error('[boot] autostart failed:', err.message); }
 }
 
 /* ============================================================
@@ -753,6 +896,7 @@ app.use(cookieParser());
 const authLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const signupLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 });
 const createProjectLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20 });
+const aiLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
 
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -761,9 +905,12 @@ app.get('/health', (req, res) => {
     uptime: Math.floor(process.uptime()),
     running: running.size,
     projects: projectNames.size,
-    version: '1.2.1',
+    ai: AI_ENABLED ? 'enabled' : 'disabled',
+    version: '1.3.0',
   });
 });
+
+/* ---------- Auth routes ---------- */
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
@@ -801,6 +948,97 @@ app.get('/api/auth/me', async (req, res) => {
   if (!user) return res.json({ user: null });
   res.json({ user: { id: String(user._id), email: user.email } });
 });
+
+/* ---------- AI endpoints ---------- */
+
+app.get('/api/ai/status', requireAuth, (req, res) => {
+  res.json({ enabled: AI_ENABLED, model: GROQ_MODEL });
+});
+
+/**
+ * Chat about a specific project. Injects logs + file tree into context.
+ *
+ * Body: { message: string, history?: [{role, content}], file?: string }
+ */
+app.post('/api/projects/:id/ai', requireAuth, aiLimiter, async (req, res) => {
+  try {
+    if (!AI_ENABLED) return res.status(503).json({ error: 'AI not configured (set GROQ_API_KEY)' });
+
+    const p = await Project.findById(req.params.id);
+    if (!p) return res.status(404).json({ error: 'Not found' });
+    if (p.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const body = req.body || {};
+    const message = String(body.message || '').trim();
+    if (!message) return res.status(400).json({ error: 'Message required' });
+    if (message.length > 4000) return res.status(400).json({ error: 'Message too long (max 4000 chars)' });
+
+    // Bounded conversation history (last 6 turns)
+    const history = Array.isArray(body.history) ? body.history.slice(-6) : [];
+    const cleanHistory = history
+      .filter((h) => h && typeof h === 'object' && typeof h.content === 'string')
+      .map((h) => ({
+        role: h.role === 'assistant' ? 'assistant' : 'user',
+        content: String(h.content).slice(0, 4000),
+      }));
+
+    const ctx = buildProjectContext(p, { includeFile: body.file });
+
+    const messages = [
+      { role: 'system', content: AI_SYSTEM_PROMPT },
+      ...cleanHistory,
+      { role: 'user', content: ctx + '\n\n=== USER QUESTION ===\n' + message },
+    ];
+
+    const result = await callGroq(messages, { temperature: 0.25, maxTokens: 1400 });
+    res.json({
+      reply: result.reply,
+      model: result.model,
+      usage: result.usage,
+    });
+  } catch (err) {
+    console.error('[ai:project]', err.message);
+    res.status(500).json({ error: 'AI request failed: ' + err.message });
+  }
+});
+
+/**
+ * General chat without project context.
+ *
+ * Body: { message: string, history?: [{role, content}] }
+ */
+app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
+  try {
+    if (!AI_ENABLED) return res.status(503).json({ error: 'AI not configured (set GROQ_API_KEY)' });
+
+    const body = req.body || {};
+    const message = String(body.message || '').trim();
+    if (!message) return res.status(400).json({ error: 'Message required' });
+    if (message.length > 4000) return res.status(400).json({ error: 'Message too long (max 4000 chars)' });
+
+    const history = Array.isArray(body.history) ? body.history.slice(-6) : [];
+    const cleanHistory = history
+      .filter((h) => h && typeof h === 'object' && typeof h.content === 'string')
+      .map((h) => ({
+        role: h.role === 'assistant' ? 'assistant' : 'user',
+        content: String(h.content).slice(0, 4000),
+      }));
+
+    const messages = [
+      { role: 'system', content: AI_SYSTEM_PROMPT },
+      ...cleanHistory,
+      { role: 'user', content: message },
+    ];
+
+    const result = await callGroq(messages, { temperature: 0.35, maxTokens: 1200 });
+    res.json({ reply: result.reply, model: result.model, usage: result.usage });
+  } catch (err) {
+    console.error('[ai:chat]', err.message);
+    res.status(500).json({ error: 'AI request failed: ' + err.message });
+  }
+});
+
+/* ---------- Projects API ---------- */
 
 app.get('/api/projects', requireAuth, async (req, res) => {
   const list = await Project.find({ user_id: req.user.id }).sort({ createdAt: -1 }).lean();
@@ -925,7 +1163,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 /* ============================================================
- * Dashboard HTML — same UI as before
+ * Dashboard HTML
  * ============================================================ */
 
 const DASHBOARD_HTML = String.raw`<!doctype html>
@@ -947,6 +1185,8 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
   --wn:#f59e0b;--wn-bg:rgba(245,158,11,.10);--wn-bd:rgba(245,158,11,.22);
   --er:#ef4444;--er-bg:rgba(239,68,68,.10);--er-bd:rgba(239,68,68,.22);
   --in:#3b82f6;--in-bg:rgba(59,130,246,.10);--in-bd:rgba(59,130,246,.22);
+  --ai:#8b5cf6;--ai-2:#6366f1;
+  --ai-glow:rgba(139,92,246,.4);
   --display:'Manrope','Inter',system-ui,sans-serif;
   --body:'Inter',system-ui,sans-serif;
   --mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
@@ -1021,6 +1261,11 @@ input,textarea{font:inherit;}
 .btn-ghost:hover{background:var(--surface);color:var(--tx-soft);border-color:var(--bd-strong);}
 .btn-danger{background:transparent;color:var(--er);border-color:var(--er-bd);}
 .btn-danger:hover{background:var(--er-bg);border-color:var(--er);}
+.btn-ai{background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
+  color:#fff;border-color:transparent;font-weight:600;
+  box-shadow:0 0 20px -4px var(--ai-glow);}
+.btn-ai:hover{filter:brightness(1.1);transform:translateY(-1px);
+  box-shadow:0 0 28px -4px var(--ai-glow);}
 .btn.sm{height:30px;padding:0 11px;font-size:11.5px;border-radius:6px;}
 .btn.sm i{font-size:10.5px;}
 .btn.block{width:100%;height:42px;}
@@ -1165,7 +1410,7 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   display:flex;align-items:center;justify-content:space-between;gap:12px;}
 .dlg-foot .err{flex:1;margin:0;}
 .dlg-foot .actions{display:flex;gap:8px;}
-.toast{position:fixed;bottom:24px;right:24px;padding:14px 18px 14px 14px;
+.toast{position:fixed;bottom:24px;left:24px;padding:14px 18px 14px 14px;
   background:linear-gradient(180deg,var(--overlay) 0%,var(--surface) 100%);
   border:1px solid var(--bd-strong);border-radius:var(--r);
   box-shadow:var(--sh-2xl),var(--sh-inset);color:var(--tx-soft);font-size:13px;
@@ -1176,49 +1421,135 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   align-items:center;justify-content:center;flex-shrink:0;font-size:13px;}
 .toast-icon.ok{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-bd);}
 .toast-icon.err{background:var(--er-bg);color:var(--er);border:1px solid var(--er-bd);}
-.terminal{position:fixed;left:0;right:0;bottom:0;height:60vh;background:#050507;
-  border-top:1px solid var(--bd-strong);display:flex;flex-direction:column;
-  transform:translateY(110%);transition:transform .32s cubic-bezier(.4,0,.2,1);
-  z-index:200;box-shadow:0 -32px 64px -20px rgba(0,0,0,.85);}
-.terminal.open{transform:translateY(0);}
-.term-head{display:flex;align-items:center;gap:14px;padding:12px 18px;
-  background:linear-gradient(180deg,#0b0b0e 0%,#08080a 100%);
-  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:12px;}
-.term-dots{display:flex;gap:8px;}
-.term-dots span{width:12px;height:12px;border-radius:50%;display:inline-block;}
-.term-dots .d1{background:#ff5f57;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
-.term-dots .d2{background:#febc2e;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
-.term-dots .d3{background:#28c840;box-shadow:inset 0 0 0 1px rgba(0,0,0,.3);}
-.term-title{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;
-  color:var(--tx-mut);font-family:var(--mono);font-size:11.5px;
+
+/* ---------------- AI Assistant ---------------- */
+.ai-fab {
+  position:fixed;bottom:28px;right:28px;width:56px;height:56px;border-radius:50%;
+  background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
+  color:#fff;font-size:22px;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 28px -4px var(--ai-glow),0 2px 8px rgba(0,0,0,.5);
+  z-index:250;transition:transform .2s,box-shadow .2s;
+  border:1px solid rgba(255,255,255,.15);cursor:pointer;
+}
+.ai-fab:hover{transform:scale(1.06);box-shadow:0 12px 36px -4px var(--ai-glow),0 4px 12px rgba(0,0,0,.5);}
+.ai-fab::after {
+  content:'';position:absolute;inset:-6px;border-radius:50%;
+  background:radial-gradient(circle,var(--ai-glow),transparent 70%);
+  z-index:-1;animation:aiPulse 2.4s ease-in-out infinite;pointer-events:none;
+}
+@keyframes aiPulse {
+  0%,100% { transform:scale(1);opacity:.65; }
+  50%     { transform:scale(1.2);opacity:0; }
+}
+.ai-fab.hidden{display:none!important;}
+
+.ai-panel {
+  position:fixed;top:0;right:0;bottom:0;width:440px;max-width:100vw;
+  background:linear-gradient(180deg,#0d0d10 0%,#0a0a0c 100%);
+  border-left:1px solid var(--bd-strong);display:flex;flex-direction:column;
+  transform:translateX(105%);
+  transition:transform .3s cubic-bezier(.4,0,.2,1);
+  z-index:260;box-shadow:-32px 0 64px -16px rgba(0,0,0,.75);
+}
+.ai-panel.open{transform:translateX(0);}
+
+.ai-head{padding:18px 20px;border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  background:linear-gradient(180deg,rgba(139,92,246,.06),transparent);}
+.ai-head-left{display:flex;align-items:center;gap:11px;min-width:0;}
+.ai-head-icon{width:36px;height:36px;border-radius:10px;
+  background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-size:16px;flex-shrink:0;
+  box-shadow:0 0 20px -4px var(--ai-glow);}
+.ai-head-text{min-width:0;}
+.ai-head-title{font-family:var(--display);font-size:15px;font-weight:700;
+  letter-spacing:-.02em;color:var(--tx);line-height:1.2;}
+.ai-head-sub{font-size:11px;color:var(--tx-dim);margin-top:1px;
+  font-family:var(--mono);letter-spacing:-.01em;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.term-title i{color:var(--tx-dim);font-size:10px;}
-.term-actions{display:flex;align-items:center;gap:14px;font-size:11.5px;color:var(--tx-mut);}
-.term-live{display:inline-flex;align-items:center;gap:6px;
-  font-family:var(--mono);font-size:9.5px;font-weight:600;
-  letter-spacing:.11em;text-transform:uppercase;color:var(--ok);}
-.term-live-dot{width:6px;height:6px;border-radius:50%;background:currentColor;
-  box-shadow:0 0 8px currentColor;animation:pulse 1.5s ease-in-out infinite;}
-.term-live.paused{color:var(--tx-dim);}
-.term-live.paused .term-live-dot{box-shadow:none;animation:none;}
-.term-follow{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
-  user-select:none;color:var(--tx-mut);font-family:var(--mono);font-size:11px;}
-.term-follow input{width:auto;accent-color:#71717a;cursor:pointer;transform:scale(.9);}
-.term-close{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;
-  background:var(--surface);border:1px solid var(--bd);border-radius:6px;
-  color:var(--tx-mut);font-family:var(--mono);font-size:10.5px;
-  letter-spacing:.05em;text-transform:uppercase;transition:all .15s;}
-.term-close:hover{color:var(--tx);border-color:var(--bd-strong);background:var(--raised);}
-.term-body{flex:1;margin:0;padding:18px 22px 32px;overflow-y:auto;
-  font-family:var(--mono);font-size:12.5px;line-height:1.65;
-  white-space:pre-wrap;word-break:break-word;background:#050507;color:var(--tx-soft);}
-.term-body::-webkit-scrollbar-thumb{background:#1c1c21;border-color:#050507;}
-.log-line{display:block;min-height:1em;}
-.log-line.partial::after{content:'▋';margin-left:2px;color:var(--tx-dim);
-  animation:blink 1s steps(2,start) infinite;}
-@keyframes blink{to{opacity:0}}
-.log-cmd{color:#86efac;}.log-err{color:#fca5a5;}.log-sys{color:var(--tx-mut);}
-.log-ok{color:#93c5fd;}.log-info{color:#fde68a;}.log-out{color:var(--tx-soft);}
+.ai-close{width:32px;height:32px;border-radius:8px;display:flex;
+  align-items:center;justify-content:center;color:var(--tx-mut);
+  transition:all .15s;flex-shrink:0;font-size:14px;}
+.ai-close:hover{background:var(--raised);color:var(--tx);}
+
+.ai-messages{flex:1;overflow-y:auto;padding:20px;
+  display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;}
+.ai-messages::-webkit-scrollbar-thumb{background:#1c1c21;}
+
+.ai-msg{padding:11px 14px;border-radius:10px;font-size:13px;line-height:1.6;
+  max-width:92%;word-wrap:break-word;overflow-wrap:break-word;
+  animation:aiMsgIn .22s cubic-bezier(.4,0,.2,1);}
+@keyframes aiMsgIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.ai-msg.user{background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
+  color:#fff;align-self:flex-end;margin-left:auto;
+  box-shadow:0 4px 12px -4px var(--ai-glow);}
+.ai-msg.assistant{background:var(--raised);border:1px solid var(--bd);
+  color:var(--tx-soft);align-self:flex-start;
+  box-shadow:var(--sh-inset);}
+.ai-msg.assistant p{margin:0 0 8px;}
+.ai-msg.assistant p:last-child{margin-bottom:0;}
+.ai-msg.assistant strong{color:var(--tx);font-weight:600;}
+.ai-msg.assistant em{color:var(--tx-soft);font-style:italic;}
+.ai-msg.assistant code{
+  font-family:var(--mono);font-size:11.5px;padding:2px 5px;border-radius:4px;
+  background:#050507;border:1px solid var(--bd);color:#a5b4fc;
+}
+.ai-msg.assistant pre{
+  margin:10px 0;padding:12px 14px;border-radius:8px;
+  background:#050507;border:1px solid var(--bd);
+  font-family:var(--mono);font-size:11.5px;line-height:1.55;
+  overflow-x:auto;white-space:pre;
+}
+.ai-msg.assistant pre code{background:none;border:0;padding:0;color:var(--tx-soft);font-size:inherit;}
+.ai-msg.system{padding:10px 14px;font-size:12px;color:var(--tx-dim);
+  align-self:center;text-align:center;font-style:italic;max-width:80%;}
+.ai-msg.error{background:var(--er-bg);border:1px solid var(--er-bd);color:#fca5a5;font-size:12.5px;}
+
+.ai-typing{display:inline-flex;gap:4px;align-items:center;padding:4px 0;}
+.ai-typing span{width:6px;height:6px;border-radius:50%;background:var(--tx-dim);
+  animation:aiTyping 1.2s ease-in-out infinite;}
+.ai-typing span:nth-child(2){animation-delay:.15s;}
+.ai-typing span:nth-child(3){animation-delay:.3s;}
+@keyframes aiTyping{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
+
+.ai-suggestions{display:flex;flex-wrap:wrap;gap:6px;padding:0 20px 12px;}
+.ai-suggestions:empty{display:none;}
+.ai-chip{padding:5px 10px;border-radius:100px;
+  background:var(--raised);border:1px solid var(--bd);
+  color:var(--tx-mut);font-size:11px;font-weight:500;
+  transition:all .15s;white-space:nowrap;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;}
+.ai-chip:hover{border-color:var(--ai);color:var(--tx);
+  background:rgba(139,92,246,.08);transform:translateY(-1px);}
+.ai-chip i{font-size:10px;color:var(--ai);}
+
+.ai-input-wrap{padding:16px 20px 20px;border-top:1px solid var(--bd);
+  background:linear-gradient(180deg,transparent,rgba(139,92,246,.03));}
+.ai-input-inner{display:flex;align-items:flex-end;gap:10px;
+  background:var(--bg);border:1px solid var(--bd-strong);border-radius:12px;
+  padding:10px 10px 10px 14px;transition:border-color .15s,box-shadow .15s;}
+.ai-input-inner:focus-within{border-color:var(--ai);
+  box-shadow:0 0 0 3px rgba(139,92,246,.12);}
+.ai-input{flex:1;background:none;border:0;color:var(--tx);
+  font-family:var(--body);font-size:13.5px;line-height:1.5;
+  resize:none;outline:none;padding:0;max-height:180px;min-height:24px;}
+.ai-input::placeholder{color:var(--tx-dim);}
+.ai-send{width:36px;height:36px;border-radius:9px;
+  background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
+  color:#fff;font-size:14px;display:flex;align-items:center;justify-content:center;
+  transition:all .15s;flex-shrink:0;
+  box-shadow:0 0 16px -4px var(--ai-glow);}
+.ai-send:hover{transform:translateY(-1px);box-shadow:0 0 24px -4px var(--ai-glow);}
+.ai-send:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none;}
+.ai-footer{display:flex;align-items:center;justify-content:space-between;
+  margin-top:10px;font-size:10.5px;color:var(--tx-dim);
+  font-family:var(--mono);letter-spacing:-.01em;}
+.ai-footer .ai-model{color:var(--ai);font-weight:600;}
+.ai-clear{color:var(--tx-dim);cursor:pointer;background:none;border:0;
+  font-size:10.5px;font-family:inherit;letter-spacing:inherit;}
+.ai-clear:hover{color:var(--tx-soft);}
+
 @media(max-width:640px){
   .topbar-in,.container{padding:0 20px;}
   .page-head{flex-direction:column;align-items:stretch;gap:16px;}
@@ -1228,6 +1559,8 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   .card-actions .btn{flex:0 1 auto;min-width:auto;}
   .auth-wrap{padding:24px 16px;}
   .toast{left:16px;right:16px;bottom:16px;max-width:none;}
+  .ai-panel{width:100vw;}
+  .ai-fab{bottom:20px;right:20px;}
 }
 </style>
 </head>
@@ -1322,6 +1655,37 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   <pre class="term-body" id="termBody"></pre>
 </div>
 
+<!-- AI FAB -->
+<button class="ai-fab hidden" id="aiFab" title="Ask AI Assistant">
+  <i class="fa-solid fa-wand-magic-sparkles"></i>
+</button>
+
+<!-- AI Panel -->
+<aside class="ai-panel" id="aiPanel" aria-hidden="true">
+  <div class="ai-head">
+    <div class="ai-head-left">
+      <div class="ai-head-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
+      <div class="ai-head-text">
+        <div class="ai-head-title">AI Assistant</div>
+        <div class="ai-head-sub" id="aiContextLabel">General Node.js help</div>
+      </div>
+    </div>
+    <button class="ai-close" id="aiClose" type="button" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+  </div>
+  <div class="ai-messages" id="aiMessages"></div>
+  <div class="ai-suggestions" id="aiSuggestions"></div>
+  <form class="ai-input-wrap" id="aiForm">
+    <div class="ai-input-inner">
+      <textarea class="ai-input" id="aiInput" placeholder="Ask about your deployment, errors, or how to fix something..." rows="1"></textarea>
+      <button class="ai-send" id="aiSend" type="submit" title="Send"><i class="fa-solid fa-arrow-up"></i></button>
+    </div>
+    <div class="ai-footer">
+      <span>Powered by <span class="ai-model" id="aiModelLabel">Groq</span></span>
+      <button type="button" class="ai-clear" id="aiClear">Clear chat</button>
+    </div>
+  </form>
+</aside>
+
 <script>
 (function(){
 'use strict';
@@ -1350,10 +1714,35 @@ function api(url,opts){
     });
   });
 }
+/* Tiny markdown renderer — safe for AI output */
+function renderMarkdown(text){
+  var s=String(text||'').replace(/[&<>]/g,function(c){
+    return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});
+  var blocks=[];
+  s=s.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g,function(_,code){
+    var i=blocks.length;blocks.push('<pre><code>'+code.replace(/\n$/,'')+'</code></pre>');
+    return '\u0001B'+i+'\u0001';
+  });
+  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  s=s.replace(/\n/g,'<br>');
+  s=s.replace(/\u0001B(\d+)\u0001/g,function(_,i){return blocks[+i];});
+  return s;
+}
+
 var user=null,authMode='login',projects=[],pollTimer=null;
 var currentProjectId=null,eventSource=null,partialLine='';
 var terminalEl=$('terminal'),termBody=$('termBody'),termTitle=$('termTitle');
 var termLive=$('termLive'),autoScroll=$('autoScroll');
+
+/* ---------- AI state ---------- */
+var aiProjectId=null;       // null = general chat
+var aiProjectName=null;
+var aiHistory=[];           // [{role, content}]
+var aiBusy=false;
+var aiEnabled=true;         // updated from /api/ai/status
+
 function setAuthMode(mode){
   authMode=mode;var isL=mode==='login';
   $('tabLogin').classList.toggle('active',isL);$('tabSignup').classList.toggle('active',!isL);
@@ -1375,11 +1764,12 @@ $('authForm').onsubmit=function(e){
 };
 $('logoutBtn').onclick=function(){
   api('/api/auth/logout',{method:'POST'}).catch(function(){}).then(function(){
-    user=null;projects=[];closeTerminal();renderAuth();
+    user=null;projects=[];closeTerminal();closeAI();renderAuth();
   });
 };
 function renderAuth(){
   show($('topbar'),!!user);show($('dashView'),!!user);show($('authView'),!user);
+  show($('aiFab'),!!user);
   if(user){$('userEmail').textContent=user.email;$('userAv').textContent=user.email.charAt(0).toUpperCase();}
 }
 function loadProjects(){
@@ -1423,6 +1813,7 @@ function renderProjects(){
       '<div class="url"><i class="fa-solid fa-link"></i><a href="'+esc(appUrl(p.name))+'" target="_blank">'+esc(appUrl(p.name))+'</a><span class="tag">path</span></div>'+
       '</div>'+
       '<div class="card-actions">'+
+      '<button class="btn btn-ai sm" data-act="ask"><i class="fa-solid fa-wand-magic-sparkles"></i>Ask AI</button>'+
       '<button class="btn btn-secondary sm" data-act="deploy"><i class="fa-solid fa-bolt"></i>Deploy</button>'+
       (isR?'<button class="btn btn-ghost sm" data-act="stop"><i class="fa-solid fa-stop"></i>Stop</button>'
           :'<button class="btn btn-ghost sm" data-act="restart"><i class="fa-solid fa-play"></i>Start</button>')+
@@ -1453,12 +1844,15 @@ $('projects').addEventListener('click',function(e){
   } else if(act==='delete'){
     if(!confirm('Delete this project permanently?'))return;
     if(currentProjectId===id)closeTerminal();
+    if(aiProjectId===id)resetAI();
     api('/api/projects/'+id,{method:'DELETE'})
     .then(function(){toast('Deleted');loadProjects();})
     .catch(function(err){toast(err.message,true);});
   } else if(act==='logs'){
     if(currentProjectId===id&&terminalEl.classList.contains('open'))closeTerminal();
     else openTerminal(id,proj.name);
+  } else if(act==='ask'){
+    openAI(id,proj.name);
   }
 });
 function stripAnsi(s){return s.replace(/\x1b\[[0-9;]*m/g,'');}
@@ -1515,7 +1909,189 @@ termBody.addEventListener('scroll',function(){
 });
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&terminalEl.classList.contains('open'))closeTerminal();
+  if(e.key==='Escape'&&aiPanel.classList.contains('open'))closeAI();
 });
+
+/* ================= AI ASSISTANT ================= */
+var aiPanel=$('aiPanel');
+var aiMessages=$('aiMessages');
+var aiSuggestions=$('aiSuggestions');
+var aiInput=$('aiInput');
+var aiSend=$('aiSend');
+var aiContextLabel=$('aiContextLabel');
+var aiModelLabel=$('aiModelLabel');
+
+function aiAddMessage(role,html){
+  var el=document.createElement('div');
+  el.className='ai-msg '+role;
+  if(role==='assistant'||role==='user'){
+    el.innerHTML=role==='assistant'?renderMarkdown(html):esc(html).replace(/\n/g,'<br>');
+  } else {
+    el.textContent=html;
+  }
+  aiMessages.appendChild(el);
+  aiMessages.scrollTop=aiMessages.scrollHeight;
+  return el;
+}
+
+function aiAddTyping(){
+  var el=document.createElement('div');
+  el.className='ai-msg assistant';
+  el.id='aiTypingIndicator';
+  el.innerHTML='<div class="ai-typing"><span></span><span></span><span></span></div>';
+  aiMessages.appendChild(el);
+  aiMessages.scrollTop=aiMessages.scrollHeight;
+  return el;
+}
+
+function aiRemoveTyping(){
+  var el=$('aiTypingIndicator');
+  if(el&&el.parentNode)el.parentNode.removeChild(el);
+}
+
+var SUGGESTIONS_GENERAL=[
+  {icon:'fa-circle-question',text:'How do I fix "Cannot find module"?'},
+  {icon:'fa-server',text:'App is not responding on its port'},
+  {icon:'fa-lock',text:'How do I add a database?'},
+];
+var SUGGESTIONS_PROJECT=[
+  {icon:'fa-bug',text:'Why did my deploy fail?'},
+  {icon:'fa-scroll',text:'Explain the logs'},
+  {icon:'fa-link',text:'My /login route returns 404'},
+  {icon:'fa-server',text:'App never opened its port'},
+  {icon:'fa-image',text:'Why are my static assets 404?'},
+];
+
+function aiRenderSuggestions(){
+  var list=aiProjectId?SUGGESTIONS_PROJECT:SUGGESTIONS_GENERAL;
+  aiSuggestions.innerHTML=list.map(function(s){
+    return '<button class="ai-chip" type="button" data-q="'+esc(s.text)+'">'+
+      '<i class="fa-solid '+s.icon+'"></i>'+esc(s.text)+'</button>';
+  }).join('');
+}
+
+function aiSetContext(projectId,projectName){
+  aiProjectId=projectId;
+  aiProjectName=projectName;
+  if(projectId){
+    aiContextLabel.textContent='Project: '+projectName;
+  } else {
+    aiContextLabel.textContent='General Node.js help';
+  }
+  aiRenderSuggestions();
+}
+
+function openAI(projectId,projectName){
+  if(!aiEnabled){
+    toast('AI is not configured on this server',true);
+    return;
+  }
+  var changed=(projectId||null)!==(aiProjectId||null);
+  if(changed){
+    aiSetContext(projectId||null,projectName||null);
+    // Reset conversation when switching context
+    aiMessages.innerHTML='';
+    aiHistory=[];
+    aiWelcome();
+  }
+  aiPanel.classList.add('open');
+  aiPanel.setAttribute('aria-hidden','false');
+  setTimeout(function(){aiInput.focus();},120);
+}
+
+function closeAI(){
+  aiPanel.classList.remove('open');
+  aiPanel.setAttribute('aria-hidden','true');
+}
+
+function resetAI(){
+  aiSetContext(null,null);
+  aiMessages.innerHTML='';
+  aiHistory=[];
+  aiWelcome();
+}
+
+function aiWelcome(){
+  if(aiProjectId){
+    aiAddMessage('system','Ask me anything about "'+aiProjectName+'". I can see its recent logs, file tree, and config.');
+  } else {
+    aiAddMessage('system','Hi! I can help you debug Node.js deployment issues, explain errors, and suggest fixes. Ask me anything.');
+  }
+}
+
+async function aiSendMessage(text){
+  text=String(text||'').trim();
+  if(!text||aiBusy)return;
+  aiBusy=true;
+  aiSend.disabled=true;
+
+  aiAddMessage('user',text);
+  aiHistory.push({role:'user',content:text});
+
+  aiInput.value='';
+  aiInput.style.height='auto';
+
+  aiAddTyping();
+
+  try{
+    var url=aiProjectId?'/api/projects/'+aiProjectId+'/ai':'/api/ai/chat';
+    // Send last few turns (excluding the one we just added) as history
+    var hist=aiHistory.slice(0,-1).slice(-6);
+    var result=await api(url,{
+      method:'POST',
+      body:{message:text,history:hist}
+    });
+    aiRemoveTyping();
+    var reply=result.reply||'(no response)';
+    aiAddMessage('assistant',reply);
+    aiHistory.push({role:'assistant',content:reply});
+    if(result.model)aiModelLabel.textContent=result.model.split('-').slice(0,2).join('-');
+  }catch(err){
+    aiRemoveTyping();
+    aiAddMessage('error','Error: '+err.message);
+  }finally{
+    aiBusy=false;
+    aiSend.disabled=false;
+  }
+}
+
+aiSuggestions.addEventListener('click',function(e){
+  var chip=e.target.closest('.ai-chip');
+  if(!chip)return;
+  var q=chip.getAttribute('data-q');
+  if(q)aiSendMessage(q);
+});
+
+$('aiForm').onsubmit=function(e){
+  e.preventDefault();
+  aiSendMessage(aiInput.value);
+};
+
+aiInput.addEventListener('input',function(){
+  aiInput.style.height='auto';
+  aiInput.style.height=Math.min(aiInput.scrollHeight,180)+'px';
+});
+aiInput.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&!e.shiftKey){
+    e.preventDefault();
+    $('aiForm').dispatchEvent(new Event('submit',{cancelable:true}));
+  }
+});
+
+$('aiClose').onclick=closeAI;
+$('aiClear').onclick=function(){
+  aiHistory=[];
+  aiMessages.innerHTML='';
+  aiWelcome();
+  aiRenderSuggestions();
+};
+
+$('aiFab').onclick=function(){
+  if(aiPanel.classList.contains('open'))closeAI();
+  else openAI(null,null);
+};
+
+/* ================= BOOT ================= */
 $('newProjectBtn').onclick=function(){
   $('newHint').textContent='/myapp/';$('newErr').textContent='';$('newDialog').showModal();
 };
@@ -1543,9 +2119,21 @@ $('newForm').onsubmit=function(e){
   }).catch(function(err){errEl.textContent=err.message;})
   .then(function(){btn.disabled=false;});
 };
+
 setAuthMode('login');
 api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(function(){
-  renderAuth();if(user)return loadProjects();
+  renderAuth();
+  if(user){
+    return Promise.all([
+      loadProjects(),
+      api('/api/ai/status').then(function(s){
+        aiEnabled=!!s.enabled;
+        if(s.model)aiModelLabel.textContent=s.model.split('-').slice(0,2).join('-');
+      }).catch(function(){aiEnabled=false;}),
+    ]);
+  }
+}).then(function(){
+  if(user&&aiEnabled)aiWelcome();
 }).then(function(){
   pollTimer=setInterval(function(){
     if(user&&document.visibilityState==='visible')loadProjects();
@@ -1559,7 +2147,7 @@ api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(fun
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 
 /* ============================================================
- * Reverse proxy — path-based with HTML rewriting
+ * Reverse proxy with HTML rewriting
  * ============================================================ */
 
 const proxy = httpProxy.createProxyServer({
@@ -1583,7 +2171,6 @@ function rewriteHtml(html, projectName) {
   const attrRe = /\b(href|src|action|poster)\s*=\s*(["'])\/(?!\/)/gi;
   html = html.replace(attrRe, (_m, attr, q) => attr + '=' + q + prefix + '/');
   html = html.replace(/url\(\s*(["']?)\/(?!\/)/gi, (_m, q) => 'url(' + q + prefix + '/');
-
   return html;
 }
 
@@ -1792,8 +2379,11 @@ async function boot() {
   console.log('  ──────────────────────────────────────────');
   console.log('  tar        ✓  v' + require('tar/package.json').version + ' (' + (tar.create ? 'create' : 'pack') + ')');
 
+  if (AI_ENABLED) console.log('  AI         ✓  Groq (' + GROQ_MODEL + ')');
+  else console.log('  AI         ⚠  disabled (set GROQ_API_KEY)');
+
   if (INVITE_ONLY) console.log('  Invite     ✓  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
-  else { console.log('  Invite     ⚠  OPEN SIGNUP'); console.log('             Set ALLOWED_EMAILS to restrict'); }
+  else console.log('  Invite     ⚠  OPEN SIGNUP (set ALLOWED_EMAILS to restrict)');
 
   if (process.platform !== 'win32' && process.getuid && process.getuid() === 0) {
     console.warn('  Runtime    ⚠  running as root');
@@ -1829,14 +2419,12 @@ async function boot() {
 
   server.listen(PORT, () => {
     console.log('');
-    console.log('  MiniDeploy running  (path-based routing)');
+    console.log('  MiniDeploy running');
     console.log('  ──────────────────────────────────────────');
     console.log('  Dashboard :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/');
     console.log('  Health    :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/health');
     console.log('  Apps      :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/');
-    console.log('  App routes:  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/login → app sees /login');
-    console.log('  App ports :  ' + APP_PORT_START + ' – ' + APP_PORT_END);
-    console.log('  Timeouts  :  git ' + (GIT_TIMEOUT_MS / 1000) + 's, install idle ' + (INSTALL_IDLE_MS / 1000) + 's / max ' + (INSTALL_MAX_MS / 1000) + 's');
+    console.log('  AI        :  ' + (AI_ENABLED ? GROQ_MODEL : 'disabled'));
     console.log('');
     setTimeout(() => autoStartProjects().catch((err) => console.error('[boot]', err)), 2000);
   });
