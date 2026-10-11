@@ -39,14 +39,36 @@ const { S3Client, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } = r
 const { Upload } = require('@aws-sdk/lib-storage');
 
 /* ============================================================
+ * Config helpers — robust env parsing
+ * ============================================================ */
+
+function parsePositiveInt(value, defaultValue) {
+  if (value == null) return defaultValue;
+  const s = String(value).trim();
+  if (!s) return defaultValue;
+  const n = Number(s);
+  if (!isFinite(n) || n <= 0) return defaultValue;
+  return Math.floor(n);
+}
+
+function parseNonNegInt(value, defaultValue) {
+  if (value == null) return defaultValue;
+  const s = String(value).trim();
+  if (!s) return defaultValue;
+  const n = Number(s);
+  if (!isFinite(n) || n < 0) return defaultValue;
+  return Math.floor(n);
+}
+
+/* ============================================================
  * Config
  * ============================================================ */
 
-const PORT = Number(process.env.PORT || 3000);
-const BASE_DOMAIN = (process.env.BASE_DOMAIN || 'localhost').toLowerCase();
+const PORT = parseNonNegInt(process.env.PORT, 3000);
+const BASE_DOMAIN = (process.env.BASE_DOMAIN || 'localhost').toLowerCase().trim();
 const JWT_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET || '';
-const APP_PORT_START = Number(process.env.APP_PORT_START || 4000);
-const APP_PORT_END = Number(process.env.APP_PORT_END || 4999);
+const APP_PORT_START = parseNonNegInt(process.env.APP_PORT_START, 4000);
+const APP_PORT_END = parseNonNegInt(process.env.APP_PORT_END, 4999);
 const IS_PROD = process.env.NODE_ENV === 'production';
 const MONGO_URI = process.env.MONGO_URI;
 const B2_ENDPOINT = process.env.B2_ENDPOINT;
@@ -54,24 +76,31 @@ const B2_ACCESS_KEY_ID = process.env.B2_ACCESS_KEY_ID;
 const B2_SECRET_ACCESS_KEY = process.env.B2_SECRET_ACCESS_KEY;
 const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 const B2_REGION = process.env.B2_REGION || 'us-east-005';
-const B2_FOLDER = process.env.B2_FOLDER || 'bdeploy';
+const B2_FOLDER = (process.env.B2_FOLDER || 'bdeploy').replace(/^\/+|\/+$/g, '');
 
-// ── AI (Groq) — env only, no hardcoded key ──
+// ── AI (Groq) ──
 // NOTE: `llama-3.3-70b-versatile` was retired by Groq on 2026-08-16.
-// `openai/gpt-oss-120b` is the recommended drop-in replacement.
+// `openai/gpt-oss-120b` is the current recommended replacement.
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const AI_ENABLED = !!GROQ_API_KEY;
 
-const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || '')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const INVITE_ONLY = ALLOWED_EMAILS.length > 0;
-const MAX_PROJECTS_PER_USER = Number(process.env.MAX_PROJECTS_PER_USER || 5);
 
-const GIT_TIMEOUT_MS = Number(process.env.GIT_TIMEOUT_MS || 2 * 60 * 1000);
-const INSTALL_IDLE_MS = Number(process.env.INSTALL_IDLE_MS || 90 * 1000);
-const INSTALL_MAX_MS = Number(process.env.INSTALL_MAX_MS || 6 * 60 * 1000);
-const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS || 45 * 1000);
+// ── Project limit — FIXED ──
+// Old version: Number(process.env.MAX_PROJECTS_PER_USER || 5)
+//   If env var was "", "0", "  ", or garbage, the value became 0 or NaN,
+//   which blocked the user after the very first project.
+// New version: robust parser with a sane default of 25.
+const MAX_PROJECTS_PER_USER = parsePositiveInt(process.env.MAX_PROJECTS_PER_USER, 25);
+
+const GIT_TIMEOUT_MS = parsePositiveInt(process.env.GIT_TIMEOUT_MS, 2 * 60 * 1000);
+const INSTALL_IDLE_MS = parsePositiveInt(process.env.INSTALL_IDLE_MS, 90 * 1000);
+const INSTALL_MAX_MS = parsePositiveInt(process.env.INSTALL_MAX_MS, 6 * 60 * 1000);
+const STARTUP_TIMEOUT_MS = parsePositiveInt(process.env.STARTUP_TIMEOUT_MS, 45 * 1000);
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   console.error('FATAL: SESSION_SECRET must be >=32 chars.');
@@ -92,7 +121,7 @@ const RESERVED = new Set([
   'status','support','dashboard','test','dev','staging','root','localhost',
   'ns','ns1','ns2','smtp','imap','pop','vpn','preview',
   'health','favicon.ico','robots.txt','sitemap.xml','manifest.json',
-  'login','logout','signup','register','auth','ai',
+  'login','logout','signup','register','auth','ai','config',
 ]);
 
 /* ============================================================
@@ -370,7 +399,6 @@ async function callGroq(messages, opts) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      // Give the user a clear hint when a model is retired
       let hint = '';
       if (res.status === 404 && /model/i.test(text)) {
         hint = ' (model "' + body.model + '" is not available on Groq — set GROQ_MODEL to a current model like openai/gpt-oss-120b)';
@@ -435,9 +463,7 @@ function buildProjectContext(project, opts) {
 
   const envObj = safeJson(project.env_vars);
   const envKeys = Object.keys(envObj);
-  if (envKeys.length) {
-    parts.push('User env vars (names only): ' + envKeys.join(', '));
-  }
+  if (envKeys.length) parts.push('User env vars (names only): ' + envKeys.join(', '));
 
   if (fs.existsSync(src)) {
     const files = listSourceFiles(src);
@@ -898,7 +924,7 @@ app.use(cookieParser());
 
 const authLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const signupLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 });
-const createProjectLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20 });
+const createProjectLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 100 });
 const aiLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
 
 app.get('/health', (req, res) => {
@@ -909,7 +935,20 @@ app.get('/health', (req, res) => {
     running: running.size,
     projects: projectNames.size,
     ai: AI_ENABLED ? 'enabled' : 'disabled',
-    version: '1.3.2',
+    maxProjectsPerUser: MAX_PROJECTS_PER_USER,
+    version: '1.4.0',
+  });
+});
+
+/* ---------- Config endpoint for UI ---------- */
+
+app.get('/api/config', requireAuth, (req, res) => {
+  res.json({
+    maxProjectsPerUser: MAX_PROJECTS_PER_USER,
+    aiEnabled: AI_ENABLED,
+    aiModel: AI_ENABLED ? GROQ_MODEL : null,
+    baseDomain: BASE_DOMAIN,
+    version: '1.4.0',
   });
 });
 
@@ -1022,6 +1061,8 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
   }
 });
 
+/* ---------- Projects ---------- */
+
 app.get('/api/projects', requireAuth, async (req, res) => {
   const list = await Project.find({ user_id: req.user.id }).sort({ createdAt: -1 }).lean();
   const out = list.map((p) => {
@@ -1029,7 +1070,11 @@ app.get('/api/projects', requireAuth, async (req, res) => {
     if (running.has(String(p._id))) s.status = 'running';
     return s;
   });
-  res.json({ projects: out });
+  res.json({
+    projects: out,
+    count: out.length,
+    limit: MAX_PROJECTS_PER_USER,
+  });
 });
 
 app.post('/api/projects', requireAuth, createProjectLimiter, async (req, res) => {
@@ -1042,14 +1087,38 @@ app.post('/api/projects', requireAuth, createProjectLimiter, async (req, res) =>
     const envObj = typeof body.env === 'string' ? parseEnvText(body.env)
       : (body.env && typeof body.env === 'object' && !Array.isArray(body.env) ? body.env : {});
 
-    if (!NAME_RE.test(name)) return res.status(400).json({ error: 'Name: 1-32 chars, lowercase, alphanumeric + dash' });
-    if (RESERVED.has(name)) return res.status(400).json({ error: '"' + name + '" is reserved' });
-    if (await Project.findOne({ name })) return res.status(409).json({ error: '"' + name + '" is taken' });
-    if (!startCommand) return res.status(400).json({ error: 'Start command required' });
-    if (installCommand.length > 500 || startCommand.length > 500) return res.status(400).json({ error: 'Commands too long' });
+    console.log('[create-project] user=' + req.user.email + ' name=' + name);
 
+    if (!NAME_RE.test(name)) {
+      console.log('[create-project] rejected: invalid name');
+      return res.status(400).json({ error: 'Name: 1-32 chars, lowercase, alphanumeric + dash' });
+    }
+    if (RESERVED.has(name)) {
+      console.log('[create-project] rejected: reserved');
+      return res.status(400).json({ error: '"' + name + '" is reserved' });
+    }
+    if (await Project.findOne({ name })) {
+      console.log('[create-project] rejected: name taken');
+      return res.status(409).json({ error: '"' + name + '" is already taken' });
+    }
+    if (!startCommand) {
+      console.log('[create-project] rejected: no start command');
+      return res.status(400).json({ error: 'Start command required' });
+    }
+    if (installCommand.length > 500 || startCommand.length > 500) {
+      console.log('[create-project] rejected: commands too long');
+      return res.status(400).json({ error: 'Commands too long (max 500 chars)' });
+    }
+
+    // FIXED: robust count check with clear error
     const count = await Project.countDocuments({ user_id: req.user.id });
-    if (count >= MAX_PROJECTS_PER_USER) return res.status(403).json({ error: 'Project limit reached (' + MAX_PROJECTS_PER_USER + ')' });
+    console.log('[create-project] current count=' + count + ' limit=' + MAX_PROJECTS_PER_USER);
+    if (count >= MAX_PROJECTS_PER_USER) {
+      return res.status(403).json({
+        error: 'Project limit reached: ' + count + ' of ' + MAX_PROJECTS_PER_USER +
+               '. Delete a project or raise MAX_PROJECTS_PER_USER on the server.'
+      });
+    }
 
     const project = await Project.create({
       user_id: req.user.id, name, repo_url: repoUrl,
@@ -1059,9 +1128,17 @@ app.post('/api/projects', requireAuth, createProjectLimiter, async (req, res) =>
     const pid = String(project._id);
     projectNames.add(name);
     fs.mkdirSync(sourceDir(pid), { recursive: true });
+    console.log('[create-project] created id=' + pid + ' name=' + name);
+
     res.status(201).json({ project: serializeProject(project) });
     deployProject(pid).catch((err) => console.error('[deploy]', err));
-  } catch (err) { console.error('[create-project]', err); res.status(500).json({ error: 'Failed to create project' }); }
+  } catch (err) {
+    console.error('[create-project] ERROR:', err);
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'Project name already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create project: ' + err.message });
+  }
 });
 
 async function ownProject(req, res) {
@@ -1392,6 +1469,14 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   display:flex;align-items:center;justify-content:space-between;gap:12px;}
 .dlg-foot .err{flex:1;margin:0;}
 .dlg-foot .actions{display:flex;gap:8px;}
+
+/* New project limit warning box */
+.limit-warn{background:var(--wn-bg);border:1px solid var(--wn-bd);
+  color:var(--wn);padding:10px 14px;border-radius:8px;font-size:12px;
+  margin-bottom:16px;display:flex;align-items:center;gap:9px;}
+.limit-warn i{font-size:14px;flex-shrink:0;}
+.limit-warn.hidden{display:none;}
+
 .toast{position:fixed;bottom:24px;left:24px;padding:14px 18px 14px 14px;
   background:linear-gradient(180deg,var(--overlay) 0%,var(--surface) 100%);
   border:1px solid var(--bd-strong);border-radius:var(--r);
@@ -1404,37 +1489,27 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 .toast-icon.ok{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-bd);}
 .toast-icon.err{background:var(--er-bg);color:var(--er);border:1px solid var(--er-bd);}
 
-/* ---------------- AI Assistant ---------------- */
-.ai-fab {
-  position:fixed;bottom:28px;right:28px;width:56px;height:56px;border-radius:50%;
+/* AI panel */
+.ai-fab{position:fixed;bottom:28px;right:28px;width:56px;height:56px;border-radius:50%;
   background:linear-gradient(135deg,var(--ai) 0%,var(--ai-2) 100%);
   color:#fff;font-size:22px;display:flex;align-items:center;justify-content:center;
   box-shadow:0 8px 28px -4px var(--ai-glow),0 2px 8px rgba(0,0,0,.5);
   z-index:250;transition:transform .2s,box-shadow .2s;
-  border:1px solid rgba(255,255,255,.15);cursor:pointer;
-}
+  border:1px solid rgba(255,255,255,.15);cursor:pointer;}
 .ai-fab:hover{transform:scale(1.06);box-shadow:0 12px 36px -4px var(--ai-glow),0 4px 12px rgba(0,0,0,.5);}
-.ai-fab::after {
-  content:'';position:absolute;inset:-6px;border-radius:50%;
+.ai-fab::after{content:'';position:absolute;inset:-6px;border-radius:50%;
   background:radial-gradient(circle,var(--ai-glow),transparent 70%);
-  z-index:-1;animation:aiPulse 2.4s ease-in-out infinite;pointer-events:none;
-}
-@keyframes aiPulse {
-  0%,100% { transform:scale(1);opacity:.65; }
-  50%     { transform:scale(1.2);opacity:0; }
-}
+  z-index:-1;animation:aiPulse 2.4s ease-in-out infinite;pointer-events:none;}
+@keyframes aiPulse{0%,100%{transform:scale(1);opacity:.65}50%{transform:scale(1.2);opacity:0}}
 .ai-fab.hidden{display:none!important;}
 
-.ai-panel {
-  position:fixed;top:0;right:0;bottom:0;width:440px;max-width:100vw;
+.ai-panel{position:fixed;top:0;right:0;bottom:0;width:440px;max-width:100vw;
   background:linear-gradient(180deg,#0d0d10 0%,#0a0a0c 100%);
   border-left:1px solid var(--bd-strong);display:flex;flex-direction:column;
   transform:translateX(105%);
   transition:transform .3s cubic-bezier(.4,0,.2,1);
-  z-index:260;box-shadow:-32px 0 64px -16px rgba(0,0,0,.75);
-}
+  z-index:260;box-shadow:-32px 0 64px -16px rgba(0,0,0,.75);}
 .ai-panel.open{transform:translateX(0);}
-
 .ai-head{padding:18px 20px;border-bottom:1px solid var(--bd);
   display:flex;align-items:center;justify-content:space-between;gap:12px;
   background:linear-gradient(180deg,rgba(139,92,246,.06),transparent);}
@@ -1454,11 +1529,9 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   align-items:center;justify-content:center;color:var(--tx-mut);
   transition:all .15s;flex-shrink:0;font-size:14px;}
 .ai-close:hover{background:var(--raised);color:var(--tx);}
-
 .ai-messages{flex:1;overflow-y:auto;padding:20px;
   display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;}
 .ai-messages::-webkit-scrollbar-thumb{background:#1c1c21;}
-
 .ai-msg{padding:11px 14px;border-radius:10px;font-size:13px;line-height:1.6;
   max-width:92%;word-wrap:break-word;overflow-wrap:break-word;
   animation:aiMsgIn .22s cubic-bezier(.4,0,.2,1);}
@@ -1467,34 +1540,27 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   color:#fff;align-self:flex-end;margin-left:auto;
   box-shadow:0 4px 12px -4px var(--ai-glow);}
 .ai-msg.assistant{background:var(--raised);border:1px solid var(--bd);
-  color:var(--tx-soft);align-self:flex-start;
-  box-shadow:var(--sh-inset);}
+  color:var(--tx-soft);align-self:flex-start;box-shadow:var(--sh-inset);}
 .ai-msg.assistant p{margin:0 0 8px;}
 .ai-msg.assistant p:last-child{margin-bottom:0;}
 .ai-msg.assistant strong{color:var(--tx);font-weight:600;}
 .ai-msg.assistant em{color:var(--tx-soft);font-style:italic;}
-.ai-msg.assistant code{
-  font-family:var(--mono);font-size:11.5px;padding:2px 5px;border-radius:4px;
-  background:#050507;border:1px solid var(--bd);color:#a5b4fc;
-}
-.ai-msg.assistant pre{
-  margin:10px 0;padding:12px 14px;border-radius:8px;
+.ai-msg.assistant code{font-family:var(--mono);font-size:11.5px;padding:2px 5px;border-radius:4px;
+  background:#050507;border:1px solid var(--bd);color:#a5b4fc;}
+.ai-msg.assistant pre{margin:10px 0;padding:12px 14px;border-radius:8px;
   background:#050507;border:1px solid var(--bd);
   font-family:var(--mono);font-size:11.5px;line-height:1.55;
-  overflow-x:auto;white-space:pre;
-}
+  overflow-x:auto;white-space:pre;}
 .ai-msg.assistant pre code{background:none;border:0;padding:0;color:var(--tx-soft);font-size:inherit;}
 .ai-msg.system{padding:10px 14px;font-size:12px;color:var(--tx-dim);
   align-self:center;text-align:center;font-style:italic;max-width:80%;}
 .ai-msg.error{background:var(--er-bg);border:1px solid var(--er-bd);color:#fca5a5;font-size:12.5px;}
-
 .ai-typing{display:inline-flex;gap:4px;align-items:center;padding:4px 0;}
 .ai-typing span{width:6px;height:6px;border-radius:50%;background:var(--tx-dim);
   animation:aiTyping 1.2s ease-in-out infinite;}
 .ai-typing span:nth-child(2){animation-delay:.15s;}
 .ai-typing span:nth-child(3){animation-delay:.3s;}
 @keyframes aiTyping{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
-
 .ai-suggestions{display:flex;flex-wrap:wrap;gap:6px;padding:0 20px 12px;}
 .ai-suggestions:empty{display:none;}
 .ai-chip{padding:5px 10px;border-radius:100px;
@@ -1505,7 +1571,6 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
 .ai-chip:hover{border-color:var(--ai);color:var(--tx);
   background:rgba(139,92,246,.08);transform:translateY(-1px);}
 .ai-chip i{font-size:10px;color:var(--ai);}
-
 .ai-input-wrap{padding:16px 20px 20px;border-top:1px solid var(--bd);
   background:linear-gradient(180deg,transparent,rgba(139,92,246,.03));}
 .ai-input-inner{display:flex;align-items:flex-end;gap:10px;
@@ -1642,6 +1707,10 @@ dialog::backdrop{background:rgba(5,5,7,.75);backdrop-filter:blur(6px);
   </div>
   <form id="newForm">
     <div class="dlg-body">
+      <div id="limitWarn" class="limit-warn hidden">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <span id="limitWarnText"></span>
+      </div>
       <div class="field"><label for="pName"><i class="fa-solid fa-tag"></i>Project name</label>
         <input id="pName" class="input" required placeholder="myapp" pattern="[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?">
         <div class="fhint"><i class="fa-solid fa-circle-info"></i>Lowercase, numbers, dashes. Becomes the URL path.</div></div>
@@ -1737,8 +1806,6 @@ function api(url,opts){
     });
   });
 }
-
-/* Tiny markdown renderer — avoids literal backticks in source */
 function renderMarkdown(text){
   var BQ=String.fromCharCode(96);
   var FENCE=BQ+BQ+BQ;
@@ -1772,6 +1839,10 @@ var aiHistory=[];
 var aiBusy=false;
 var aiEnabled=true;
 
+/* config */
+var maxProjectsPerUser=25;
+var projectCount=0;
+
 function setAuthMode(mode){
   authMode=mode;var isL=mode==='login';
   $('tabLogin').classList.toggle('active',isL);$('tabSignup').classList.toggle('active',!isL);
@@ -1787,7 +1858,7 @@ $('authForm').onsubmit=function(e){
   var path=authMode==='login'?'/api/auth/login':'/api/auth/signup';
   api(path,{method:'POST',body:{email:$('email').value,password:$('password').value}})
   .then(function(data){user=data.user;$('email').value='';$('password').value='';
-    renderAuth();return loadProjects();
+    renderAuth();return Promise.all([loadProjects(),loadConfig()]);
   }).catch(function(err){errEl.textContent=err.message;})
   .then(function(){btn.disabled=false;});
 };
@@ -1801,10 +1872,27 @@ function renderAuth(){
   show($('aiFab'),!!user&&aiEnabled);
   if(user){$('userEmail').textContent=user.email;$('userAv').textContent=user.email.charAt(0).toUpperCase();}
 }
+function loadConfig(){
+  if(!user)return Promise.resolve();
+  return api('/api/config').then(function(c){
+    if(typeof c.maxProjectsPerUser==='number'&&c.maxProjectsPerUser>0){
+      maxProjectsPerUser=c.maxProjectsPerUser;
+    }
+    aiEnabled=!!c.aiEnabled;
+    if(c.aiModel)aiModelLabel.textContent=c.aiModel.split('-').slice(0,2).join('-');
+    renderAuth();renderStats();
+  }).catch(function(err){
+    console.warn('config load failed:',err.message);
+  });
+}
 function loadProjects(){
   if(!user)return Promise.resolve();
   return api('/api/projects').then(function(data){
-    projects=data.projects||[];renderStats();renderProjects();
+    projects=data.projects||[];
+    if(typeof data.count==='number')projectCount=data.count;
+    else projectCount=projects.length;
+    if(typeof data.limit==='number'&&data.limit>0)maxProjectsPerUser=data.limit;
+    renderStats();renderProjects();
   }).catch(function(err){
     if(/not authenticated/i.test(err.message)){user=null;renderAuth();}
     else console.error(err);
@@ -1818,9 +1906,10 @@ function renderStats(){
     if(projects[i].status==='building'||projects[i].status==='starting')b++;
     if(projects[i].status==='failed')f++;
   }
-  var root=$('statsRow');if(!t){root.innerHTML='';return;}
+  var root=$('statsRow');if(!t&&!user){root.innerHTML='';return;}
+  var limitTxt=t+' / '+maxProjectsPerUser;
   root.innerHTML=
-    '<div class="stat"><div class="stat-icon"><i class="fa-solid fa-cubes"></i></div><div><div class="stat-val">'+t+'</div><div class="stat-lbl">Total</div></div></div>'+
+    '<div class="stat"><div class="stat-icon"><i class="fa-solid fa-cubes"></i></div><div><div class="stat-val">'+limitTxt+'</div><div class="stat-lbl">Projects</div></div></div>'+
     '<div class="stat"><div class="stat-icon ok"><i class="fa-solid fa-circle-play"></i></div><div><div class="stat-val">'+r+'</div><div class="stat-lbl">Running</div></div></div>'+
     '<div class="stat"><div class="stat-icon wn"><i class="fa-solid fa-spinner"></i></div><div><div class="stat-val">'+b+'</div><div class="stat-lbl">Building</div></div></div>'+
     '<div class="stat"><div class="stat-icon er"><i class="fa-solid fa-triangle-exclamation"></i></div><div><div class="stat-val">'+f+'</div><div class="stat-lbl">Failed</div></div></div>';
@@ -1941,7 +2030,7 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&aiPanel.classList.contains('open'))closeAI();
 });
 
-/* ================= AI ASSISTANT ================= */
+/* ================= AI ================= */
 var aiPanel=$('aiPanel');
 var aiMessages=$('aiMessages');
 var aiSuggestions=$('aiSuggestions');
@@ -2030,17 +2119,11 @@ function aiWelcome(){
 async function aiSendMessage(text){
   text=String(text||'').trim();
   if(!text||aiBusy)return;
-  aiBusy=true;
-  aiSend.disabled=true;
-
+  aiBusy=true;aiSend.disabled=true;
   aiAddMessage('user',text);
   aiHistory.push({role:'user',content:text});
-
-  aiInput.value='';
-  aiInput.style.height='auto';
-
+  aiInput.value='';aiInput.style.height='auto';
   aiAddTyping();
-
   try{
     var url=aiProjectId?'/api/projects/'+aiProjectId+'/ai':'/api/ai/chat';
     var hist=aiHistory.slice(0,-1).slice(-6);
@@ -2053,10 +2136,7 @@ async function aiSendMessage(text){
   }catch(err){
     aiRemoveTyping();
     aiAddMessage('error','Error: '+err.message);
-  }finally{
-    aiBusy=false;
-    aiSend.disabled=false;
-  }
+  }finally{aiBusy=false;aiSend.disabled=false;}
 }
 aiSuggestions.addEventListener('click',function(e){
   var chip=e.target.closest('.ai-chip');
@@ -2064,10 +2144,7 @@ aiSuggestions.addEventListener('click',function(e){
   var q=chip.getAttribute('data-q');
   if(q)aiSendMessage(q);
 });
-$('aiForm').onsubmit=function(e){
-  e.preventDefault();
-  aiSendMessage(aiInput.value);
-};
+$('aiForm').onsubmit=function(e){e.preventDefault();aiSendMessage(aiInput.value);};
 aiInput.addEventListener('input',function(){
   aiInput.style.height='auto';
   aiInput.style.height=Math.min(aiInput.scrollHeight,180)+'px';
@@ -2080,19 +2157,31 @@ aiInput.addEventListener('keydown',function(e){
 });
 $('aiClose').onclick=closeAI;
 $('aiClear').onclick=function(){
-  aiHistory=[];
-  aiMessages.innerHTML='';
-  aiWelcome();
-  aiRenderSuggestions();
+  aiHistory=[];aiMessages.innerHTML='';aiWelcome();aiRenderSuggestions();
 };
 $('aiFab').onclick=function(){
   if(aiPanel.classList.contains('open'))closeAI();
   else openAI(null,null);
 };
 
-/* ================= BOOT ================= */
+/* ================= NEW PROJECT ================= */
+function refreshLimitWarn(){
+  var warn=$('limitWarn');
+  var atLimit=projectCount>=maxProjectsPerUser;
+  if(atLimit){
+    warn.classList.remove('hidden');
+    $('limitWarnText').textContent='You have '+projectCount+' of '+maxProjectsPerUser+
+      ' projects. Delete one before creating a new one.';
+    $('newSubmit').disabled=true;
+  } else {
+    warn.classList.add('hidden');
+    $('newSubmit').disabled=false;
+  }
+}
 $('newProjectBtn').onclick=function(){
-  $('newHint').textContent='/myapp/';$('newErr').textContent='';$('newDialog').showModal();
+  $('newHint').textContent='/myapp/';$('newErr').textContent='';
+  refreshLimitWarn();
+  $('newDialog').showModal();
 };
 $('newCancel').onclick=function(){$('newDialog').close();};
 $('newDialog').addEventListener('click',function(e){if(e.target===$('newDialog'))$('newDialog').close();});
@@ -2100,7 +2189,8 @@ $('pName').addEventListener('input',function(){
   $('newHint').textContent='/'+(($('pName').value.trim().toLowerCase())||'myapp')+'/';
 });
 $('newForm').onsubmit=function(e){
-  e.preventDefault();var errEl=$('newErr');errEl.textContent='';
+  e.preventDefault();
+  var errEl=$('newErr');errEl.textContent='';
   var btn=$('newSubmit');btn.disabled=true;
   api('/api/projects',{method:'POST',body:{
     name:$('pName').value.trim().toLowerCase(),
@@ -2114,9 +2204,16 @@ $('newForm').onsubmit=function(e){
     var id=c&&c.project?c.project.id:null;
     $('newForm').reset();$('pInstall').value='npm install';$('pStart').value='npm start';
     toast('Project created — deploying');
-    return loadProjects().then(function(){if(id)openTerminal(id,nm);});
-  }).catch(function(err){errEl.textContent=err.message;})
-  .then(function(){btn.disabled=false;});
+    return loadProjects().then(function(){
+      refreshLimitWarn();
+      if(id)openTerminal(id,nm);
+    });
+  }).catch(function(err){
+    errEl.textContent=err.message;
+  }).then(function(){
+    refreshLimitWarn();
+    if(!projectCount||projectCount<maxProjectsPerUser)btn.disabled=false;
+  });
 };
 
 setAuthMode('login');
@@ -2124,6 +2221,7 @@ api('/api/auth/me').then(function(d){user=d.user;}).catch(function(){}).then(fun
   renderAuth();
   if(user){
     return Promise.all([
+      loadConfig(),
       loadProjects(),
       api('/api/ai/status').then(function(s){
         aiEnabled=!!s.enabled;
@@ -2376,6 +2474,9 @@ async function boot() {
   if (INVITE_ONLY) console.log('  Invite     OK  ' + ALLOWED_EMAILS.length + ' email(s) allowed');
   else console.log('  Invite     --  OPEN SIGNUP (set ALLOWED_EMAILS to restrict)');
 
+  console.log('  Limit      OK  ' + MAX_PROJECTS_PER_USER + ' project(s) per user' +
+    (process.env.MAX_PROJECTS_PER_USER ? '' : ' (default)'));
+
   if (process.platform !== 'win32' && process.getuid && process.getuid() === 0) {
     console.warn('  Runtime    !!  running as root');
   }
@@ -2416,6 +2517,7 @@ async function boot() {
     console.log('  Health    :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/health');
     console.log('  Apps      :  http://' + BASE_DOMAIN + (PORT === 80 ? '' : ':' + PORT) + '/<name>/');
     console.log('  AI        :  ' + (AI_ENABLED ? GROQ_MODEL : 'disabled'));
+    console.log('  Limit     :  ' + MAX_PROJECTS_PER_USER + ' projects per user');
     console.log('');
     setTimeout(() => autoStartProjects().catch((err) => console.error('[boot]', err)), 2000);
   });
